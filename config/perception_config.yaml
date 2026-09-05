@@ -1,0 +1,102 @@
+model:
+  path: "models/segformer_b1_dice.onnx"
+  num_classes: 24
+
+# Semantic classes
+classes:
+
+  0:
+    name: "grass"
+    rgb: [0, 102, 0]
+
+  1:
+    name: "tree"
+    rgb: [3, 213, 5]
+
+  2:
+    name: "pole"
+    rgb: [9, 130, 130]
+
+  3:
+    name: "water"
+    rgb: [0, 128, 255]
+
+  4:
+    name: "sky"
+    rgb: [0, 0, 255]
+
+  5:
+    name: "vehicle"
+    rgb: [255, 255, 1]
+
+  6:
+    name: "container"
+    rgb: [255, 0, 127]
+
+  7:
+    name: "asphalt"
+    rgb: [64, 64, 64]
+
+  8:
+    name: "gravel"
+    rgb: [255, 128, 0]
+
+  9:
+    name: "mulch"
+    rgb: [154, 76, 0]
+
+  10:
+    name: "rockbed"
+    rgb: [102, 102, 0]
+
+  11:
+    name: "log"
+    rgb: [102, 0, 0]
+
+  12:
+    name: "bicycle"
+    rgb: [0, 255, 128]
+
+  13:
+    name: "person"
+    rgb: [204, 153, 255]
+
+  14:
+    name: "fence"
+    rgb: [101, 0, 205]
+
+  15:
+    name: "bush"
+    rgb: [255, 153, 204]
+
+  16:
+    name: "sign"
+    rgb: [0, 102, 101]
+
+  17:
+    name: "rock"
+    rgb: [153, 204, 255]
+
+  18:
+    name: "bridge"
+    rgb: [102, 255, 255]
+
+  19:
+    name: "concrete"
+    rgb: [101, 101, 11]
+
+  20:
+    name: "table"
+    rgb: [114, 85, 47]
+
+  21:
+    name: "building"
+    rgb: [66, 0, 0]
+
+  22:
+    name: "void"
+    rgb: [7, 39, 194]
+
+  23:
+    name: "generic_ground"
+    rgb: [187, 70, 156]
