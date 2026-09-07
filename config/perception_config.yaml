@@ -1,6 +1,7 @@
 model:
-  path: "models/segformer_b1_dice.onnx"
+  path: "models/segformer_b1_tversky.onnx"
   num_classes: 24
+  device: "cuda0"
 
 # Semantic classes
 classes:
