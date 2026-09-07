@@ -2,8 +2,11 @@ from pathlib import Path
 import yaml
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
 class PerceptionConfig:
-    """Loads and provides access to the perception configuration"""
+    """Loads and provides access to the perception configuration."""
 
     def __init__(self, config_path):
         self.config_path = Path(config_path)
@@ -32,10 +35,10 @@ class PerceptionConfig:
                 "Missing 'model' section in perception configuration."
             )
 
-        self.model_path = model_config.get("path")
+        model_path = model_config.get("path")
         self.num_classes = model_config.get("num_classes")
 
-        if self.model_path is None:
+        if model_path is None:
             raise ValueError(
                 "Missing 'model.path' in perception configuration."
             )
@@ -43,6 +46,25 @@ class PerceptionConfig:
         if self.num_classes is None:
             raise ValueError(
                 "Missing 'model.num_classes' in perception configuration."
+            )
+
+        self.device = model_config.get("device")
+
+        if self.device is None:
+            raise ValueError(
+                "Missing 'model.device' in perception configuration."
+            )
+
+        model_path = Path(model_path)
+
+        if not model_path.is_absolute():
+            model_path = PROJECT_ROOT / model_path
+
+        self.model_path = model_path.resolve()
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                f"ONNX model not found: {self.model_path}"
             )
 
     def load_classes(self):
@@ -77,13 +99,13 @@ class PerceptionConfig:
             }
 
     def get_class_name(self, class_id):
-        """Return the name associated with a class ID"""
+        """Return the name associated with a class ID."""
         return self.classes[class_id]["name"]
 
     def get_class_rgb(self, class_id):
-        """Return the RGB color associated with a class ID"""
+        """Return the RGB color associated with a class ID."""
         return self.classes[class_id]["rgb"]
 
     def get_class(self, class_id):
-        """Return the complete information of a class"""
+        """Return the complete information of a class."""
         return self.classes[class_id]
