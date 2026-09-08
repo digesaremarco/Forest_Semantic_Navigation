@@ -157,3 +157,25 @@ class ClassReducer:
             )
 
         return int(self.filtered_class_ids[filtered_index])
+
+    def get_filtered_class_colors(self):
+        """
+        Return the RGB colors of the retained classes in the same
+        order as the filtered probability channels.
+
+        Returns:
+            numpy array with shape (num_kept_classes, 3).
+        """
+        colors = np.zeros(
+            (len(self.filtered_class_ids), 3),
+            dtype=np.uint8
+        )
+
+        for filtered_index, original_class_id in enumerate(
+                self.filtered_class_ids
+        ):
+            colors[filtered_index] = self.config.get_class_rgb(
+                int(original_class_id)
+            )
+
+        return colors
