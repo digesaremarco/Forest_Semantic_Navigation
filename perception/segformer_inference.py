@@ -75,10 +75,7 @@ class SegFormerInference:
                 "CUDA/cuDNN libraries are installed correctly."
             )
 
-        # ----------------------------------------------------
         # Check requested CUDA device
-        # ----------------------------------------------------
-
         print(
             f"Selected CUDA device: "
             f"{self.device}"
@@ -89,10 +86,7 @@ class SegFormerInference:
             f"{self.device_id}"
         )
 
-        # ----------------------------------------------------
         # Create CUDA session
-        # ----------------------------------------------------
-
         cuda_options = {
             "device_id": self.device_id
         }
