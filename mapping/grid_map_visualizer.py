@@ -1,23 +1,5 @@
 """
 Visualization helpers for GridMap.
-
-Kept deliberately separate from GridMap itself: GridMap fuses and
-stores per-cell data, GridMapVisualizer only reads it and draws --
-the same separation that will be used for the traversability cost
-module (GridMap fuses, the cost module interprets).
-
-Two views for now, per current requirements:
-    - plot_elevation_heatmap(): 2D heatmap of the elevation layer.
-    - plot_semantic_3d(): 3D scatter of observed cells, colored by
-      the per-cell semantic color layer.
-
-Both views:
-    - work in world-frame meters (via GridMap.cell_to_world()), not
-      raw array/cell indices;
-    - crop to the bounding box of observed cells by default, since
-      a static 20x20 m grid is mostly empty for a handful of frames
-      and plotting the full extent wastes most of the figure on
-      blank space (see conversation history / plot.png example).
 """
 
 import numpy as np
