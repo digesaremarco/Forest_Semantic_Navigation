@@ -1,0 +1,23 @@
+# Grid map configuration
+#
+# Defines the static semantic grid used to fuse the point cloud
+# produced by PointCloudBuilder (x, y, z, rgb, softmax per class)
+# into per-cell geometric + semantic information.
+#
+# The grid origin is NOT set here: it is fixed to the first pose
+# received by GridMap.update(), since no reliable global/GPS
+# reference is assumed in the forest. See GridMap for details.
+
+map:
+  # Grid extent in meters (square grid: map_length x map_length).
+  # Sized for field tests covering roughly a 20x20 m area.
+  map_length: 20.0
+
+  # Cell size in meters.
+  resolution: 0.04
+
+# Points falling outside the grid extent (e.g. the robot drifting
+# more than map_length/2 from the origin) are dropped, never
+# silently ignored: a warning is logged with how many points were
+# discarded, if this is enabled.
+out_of_bounds_warning: true
