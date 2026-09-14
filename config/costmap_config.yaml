@@ -18,7 +18,7 @@ thresholds:
 
   # Maximum step height with an immediate (4-connected) neighbor
   # cell, in meters.
-  s_max: 0.20
+  s_max: 0.25
 
 # Combination weights for:
 #   C_geo = w_slope * c_slope + w_rough * c_rough + w_step * c_step
