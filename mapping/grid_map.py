@@ -19,6 +19,45 @@ Pipeline:
         v
     elevation / rgb / semantic_probs / count
     (one static grid, 4 aligned layers)
+
+Design choices:
+
+- The grid is STATIC and world-axis-aligned, not robot-centric.
+  There is no rolling/shifting buffer: at the very first update()
+  call, the received position anchors the grid's center cell once
+  and for the whole session. The robot moves through the grid, the
+  grid itself never moves. This is deliberately simpler than
+  elevation_mapping_cupy's rolling buffer, and is the right choice
+  at this scale (a fixed ~20x20 m field-test area), where the
+  memory savings of a rolling buffer are not needed.
+
+- Fusion across frames follows the MEM paper's two closed-form,
+  "no forgetting" special cases (Sec. III-C):
+    * elevation, rgb: Bayesian inference of Gaussians (Eq. 3-7)
+      with EQUAL, CONSTANT variance for every point. Under that
+      assumption the closed-form posterior mean degenerates to a
+      plain running mean weighted by observation count -- so it is
+      implemented as a running sum + count, divided lazily in the
+      getters (avoids incremental floating-point drift).
+    * semantic_probs: Dirichlet Bayesian inference (Eq. 8-12) with
+      a flat/uninformative prior. The update rule is additive
+      (alpha_j,t = alpha_j,t-1 + sum of per-point probability
+      vectors), which is exactly a running sum of the softmax
+      channels -- so elevation/rgb and semantic_probs share the
+      same accumulation mechanism, only the normalization at
+      read-time differs conceptually (it isn't, mathematically:
+      both are "sum divided by count").
+  Exponential averaging (Eq. 2, which deliberately forgets old
+  data) is NOT implemented: it's the right choice for dynamic
+  scenes or continuous drift, neither of which applies to a single,
+  static field-test session.
+
+- Cells never observed are NaN in every layer, not zero: zero is a
+  valid observed value (e.g. z=0, or a class probability of 0), so
+  it cannot double as "unobserved". Downstream code (visualization,
+  cost) is expected to handle NaN explicitly (e.g. np.isfinite,
+  np.ma.masked_invalid), matching the pattern already used in
+  test_emc_wrapper.py.
 """
 
 import numpy as np
