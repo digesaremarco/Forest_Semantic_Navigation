@@ -1,0 +1,34 @@
+# Geometric cost configuration.
+#
+# Saturation thresholds and combination weights for the geometric
+# traversability cost C_geo(i,j), computed from GridMap's elevation
+# layer.
+
+# Saturation thresholds: reaching (or exceeding) these maps the
+# corresponding factor to cost 1.0.
+thresholds:
+  # Maximum slope angle, in degrees, still considered traversable
+  # before saturating. 30 deg matches Spot's own nominal maximum
+  # traversable slope.
+  theta_max_deg: 30.0
+
+  # Maximum local elevation roughness (std. dev. of elevation within
+  # the roughness_window), in meters.
+  sigma_max: 0.15
+
+  # Maximum step height with an immediate (4-connected) neighbor
+  # cell, in meters.
+  s_max: 0.20
+
+# Combination weights for:
+#   C_geo = w_slope * c_slope + w_rough * c_rough + w_step * c_step
+# Must sum to 1.0.
+weights:
+  slope: 0.4
+  roughness: 0.3
+  step: 0.3
+
+# Side length, in cells, of the local window used to compute
+# roughness. Must be odd, so the cell itself is the window's center
+# (e.g. 5 cells @ 0.04 m resolution = a 0.2 x 0.2 m neighborhood).
+roughness_window: 5

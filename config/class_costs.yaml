@@ -1,0 +1,22 @@
+# Per-class traversability cost c_class(k), in [0, 1].
+# 0 = fully traversable, 1 = effectively an obstacle.
+#
+# One entry per class retained by ClassReducer (16 classes).
+
+classes:
+  grass: 0.10
+  tree: 1.00
+  pole: 0.90
+  water: 0.90
+  vehicle: 1.00
+  container: 1.00
+  asphalt: 0.05
+  gravel: 0.15
+  mulch: 0.15
+  rockbed: 0.35
+  log: 0.60
+  bush: 0.50
+  rock: 0.60
+  concrete: 0.05
+  building: 1.00
+  generic_ground: 0.15
