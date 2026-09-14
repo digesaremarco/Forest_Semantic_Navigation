@@ -20,7 +20,7 @@ Pipeline:
     elevation / rgb / semantic_probs / count
     (one static grid, 4 aligned layers)
 
-Design choices:
+Design choices (see conversation history for the reasoning):
 
 - The grid is STATIC and world-axis-aligned, not robot-centric.
   There is no rolling/shifting buffer: at the very first update()
@@ -301,6 +301,24 @@ class GridMap:
         return self.safe_divide(
             self.semantic_alpha[..., class_idx],
             self.count
+        )
+
+    def get_semantic_probs_layer(self):
+        """
+        Return the per-cell class probability distribution as one
+        stacked array (all channels at once), in the same channel
+        order as self.class_names -- the natural input shape for
+        SemanticCost.compute().
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (H, W, C), float32, in [0, 1]. NaN for unobserved
+            cells.
+        """
+
+        return self.safe_divide(
+            self.semantic_alpha, self.count[..., None]
         )
 
     def get_all_semantic_layers(self):
