@@ -148,3 +148,13 @@ class TraversabilityPipeline:
         """Discard all fused data and un-anchor the grid."""
 
         self.grid_map.reset()
+
+    def save_map(self, path):
+        """Save the current grid map state to disk (see GridMap.save())."""
+
+        self.grid_map.save(path)
+
+    def load_map(self, path):
+        """Load a previously saved grid map state (see GridMap.load())."""
+
+        self.grid_map.load(path)
