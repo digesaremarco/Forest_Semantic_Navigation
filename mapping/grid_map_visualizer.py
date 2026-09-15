@@ -122,6 +122,99 @@ class GridMapVisualizer:
 
         return fig, ax
 
+    def plot_cost_heatmap(
+        self,
+        cost_layer,
+        kind="total",
+        ax=None,
+        crop_to_observed=True,
+        cmap="inferno"
+    ):
+        """
+        Draw a traversability cost layer as a 2D heatmap, in
+        world-frame meters, with unobserved cells left blank.
+
+        This method does NOT compute any cost itself -- it only
+        draws whatever array you pass it. Get that array from
+        GeometricCost.compute(...)["cost"], SemanticCost.compute(...),
+        or CostFusion.compute(...) (or TraversabilityPipeline's
+        get_cost_layer()).
+
+        Parameters
+        ----------
+        cost_layer : numpy.ndarray
+            Shape (H, W), matching this GridMap's own shape. Values
+            in [0, 1], NaN for cells with no cost.
+
+        kind : str
+            One of "geo", "sem", "total" -- purely cosmetic, only
+            picks a default title. Doesn't affect the values shown.
+
+        ax : matplotlib.axes.Axes, optional
+            Axis to draw into. A new figure/axis is created if None.
+
+        crop_to_observed : bool
+            If True (default), crop to the bounding box of observed
+            cells instead of the full static grid extent.
+
+        cmap : str
+            Matplotlib colormap name.
+
+        Returns
+        -------
+        (fig, ax)
+        """
+
+        self.require_initialized()
+
+        titles = {
+            "geo": "Geometric cost (C_geo)",
+            "sem": "Semantic cost (C_sem)",
+            "total": "Fused cost (C_total)"
+        }
+
+        if kind not in titles:
+            raise ValueError(
+                f"kind must be one of {list(titles)}, got '{kind}'."
+            )
+
+        expected_shape = (self.grid_map.cell_n, self.grid_map.cell_n)
+
+        if (
+            not isinstance(cost_layer, np.ndarray)
+            or cost_layer.shape != expected_shape
+        ):
+            raise ValueError(
+                f"cost_layer must have shape {expected_shape} "
+                f"(matching the grid), got "
+                f"{getattr(cost_layer, 'shape', type(cost_layer))}."
+            )
+
+        row_slice, col_slice = self.resolve_crop(crop_to_observed)
+        cost_view = cost_layer[row_slice, col_slice]
+        extent = self.compute_extent(row_slice, col_slice)
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 6))
+        else:
+            fig = ax.figure
+
+        im = ax.imshow(
+            np.ma.masked_invalid(cost_view),
+            cmap=cmap,
+            origin="lower",
+            extent=extent,
+            vmin=0.0,
+            vmax=1.0
+        )
+
+        ax.set_title(titles[kind])
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        fig.colorbar(im, ax=ax, fraction=0.046, label="cost")
+
+        return fig, ax
+
     def require_initialized(self):
         if not self.grid_map.is_initialized():
             raise RuntimeError(
