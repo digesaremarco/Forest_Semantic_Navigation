@@ -60,6 +60,8 @@ Design choices (see conversation history for the reasoning):
   test_emc_wrapper.py.
 """
 
+from pathlib import Path
+
 import numpy as np
 
 
@@ -410,6 +412,112 @@ class GridMap:
             int(rows.min()), int(rows.max()),
             int(cols.min()), int(cols.max())
         )
+
+    def save(self, path):
+        """
+        Save the grid's raw state to a compressed .npz file: the
+        accumulators (elevation_sum, rgb_sum, semantic_alpha, count)
+        plus the origin and enough metadata (cell_n, resolution,
+        class_names) to validate a later load() against a
+        compatible GridMap.
+
+        Saves the RAW accumulators, not the divided-out layers
+        (get_elevation_layer() etc.) -- this keeps a loaded map
+        mathematically able to keep fusing more frames afterward,
+        and avoids baking "NaN for unobserved" into the file (it is
+        recomputed from count on read instead).
+        """
+
+        if not self.is_initialized():
+            raise RuntimeError(
+                "Cannot save an uninitialized GridMap -- call "
+                "update() at least once first."
+            )
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        np.savez_compressed(
+            path,
+            origin=self.origin,
+            elevation_sum=self.elevation_sum,
+            rgb_sum=self.rgb_sum,
+            semantic_alpha=self.semantic_alpha,
+            count=self.count,
+            cell_n=np.array(self.cell_n),
+            resolution=np.array(self.resolution),
+            class_names=np.array(self.class_names)
+        )
+
+        print(f"[GridMap] Saved grid state to {path}.")
+
+    def load(self, path):
+        """
+        Load a previously saved grid state (see save()) into this
+        GridMap instance, replacing whatever it currently holds.
+
+        Validates that cell_n, resolution, and the semantic class
+        order all match this GridMap's own configuration first --
+        loading a map saved with a different grid_map_config or a
+        different retained-class set would otherwise silently
+        misalign every cell/channel instead of failing loudly.
+        """
+
+        path = Path(path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Grid map file not found: {path}")
+
+        data = np.load(path, allow_pickle=False)
+
+        required_keys = {
+            "origin", "elevation_sum", "rgb_sum", "semantic_alpha",
+            "count", "cell_n", "resolution", "class_names"
+        }
+
+        missing = required_keys - set(data.files)
+
+        if missing:
+            raise ValueError(
+                f"Grid map file {path} is missing expected arrays: "
+                f"{missing}"
+            )
+
+        saved_cell_n = int(data["cell_n"])
+
+        if saved_cell_n != self.cell_n:
+            raise ValueError(
+                f"Saved grid has cell_n={saved_cell_n}, but this "
+                f"GridMap was configured with cell_n={self.cell_n}. "
+                "Load into a GridMap built from the same "
+                "grid_map_config."
+            )
+
+        saved_resolution = float(data["resolution"])
+
+        if abs(saved_resolution - self.resolution) > 1e-9:
+            raise ValueError(
+                f"Saved grid has resolution={saved_resolution}, but "
+                "this GridMap was configured with resolution="
+                f"{self.resolution}."
+            )
+
+        saved_class_names = [str(name) for name in data["class_names"]]
+
+        if saved_class_names != self.class_names:
+            raise ValueError(
+                "Saved grid's semantic class order does not match "
+                f"this GridMap's: saved={saved_class_names}, "
+                f"current={self.class_names}."
+            )
+
+        self.origin = data["origin"].astype(np.float32)
+        self.elevation_sum = data["elevation_sum"].astype(np.float32)
+        self.rgb_sum = data["rgb_sum"].astype(np.float32)
+        self.semantic_alpha = data["semantic_alpha"].astype(np.float32)
+        self.count = data["count"].astype(np.float32)
+
+        print(f"[GridMap] Loaded grid state from {path}.")
 
     def reset(self):
         """Discard all fused data and un-anchor the grid."""
