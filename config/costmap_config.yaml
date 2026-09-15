@@ -2,7 +2,8 @@
 #
 # Saturation thresholds and combination weights for the geometric
 # traversability cost C_geo(i,j), computed from GridMap's elevation
-# layer.
+# layer. See costo_traversabilita_recap.pdf for the full
+# mathematical definition (slope / roughness / step).
 
 # Saturation thresholds: reaching (or exceeding) these maps the
 # corresponding factor to cost 1.0.
@@ -18,7 +19,7 @@ thresholds:
 
   # Maximum step height with an immediate (4-connected) neighbor
   # cell, in meters.
-  s_max: 0.25
+  s_max: 0.20
 
 # Combination weights for:
 #   C_geo = w_slope * c_slope + w_rough * c_rough + w_step * c_step
@@ -32,3 +33,9 @@ weights:
 # roughness. Must be odd, so the cell itself is the window's center
 # (e.g. 5 cells @ 0.04 m resolution = a 0.2 x 0.2 m neighborhood).
 roughness_window: 5
+
+# Weights for combining C_geo and C_sem into the final cost (see
+# cost_fusion.py). Must sum to 1.0.
+fusion:
+  weight_geo: 0.5
+  weight_sem: 0.5

@@ -25,6 +25,7 @@ class CostmapConfig:
         self.load_weights()
         self.load_roughness_window()
         self.load_class_costs()
+        self.load_fusion_weights()
 
     @staticmethod
     def read_yaml(path):
@@ -164,6 +165,40 @@ class CostmapConfig:
                 )
 
             self.class_costs[class_name] = float(cost)
+
+    def load_fusion_weights(self):
+        fusion = self._costmap_config.get("fusion")
+
+        if fusion is None:
+            raise ValueError(
+                f"Missing 'fusion' section in {self.costmap_config_path}."
+            )
+
+        self.weight_geo = fusion.get("weight_geo")
+        self.weight_sem = fusion.get("weight_sem")
+
+        required_fields = {
+            "fusion.weight_geo": self.weight_geo,
+            "fusion.weight_sem": self.weight_sem
+        }
+
+        for field_name, value in required_fields.items():
+
+            if value is None:
+                raise ValueError(
+                    f"Missing '{field_name}' in "
+                    f"{self.costmap_config_path}."
+                )
+
+            self.validate_positive(value, field_name)
+
+        total = self.weight_geo + self.weight_sem
+
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                "fusion.weight_geo + fusion.weight_sem must sum to "
+                f"1.0, got {total}."
+            )
 
     def get_cost(self, class_name):
         """Return the configured cost for a single class, by name."""
