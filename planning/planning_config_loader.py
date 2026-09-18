@@ -29,6 +29,7 @@ class PlanningConfig:
         self.load_frontier_selection()
         self.load_path_planning()
         self.load_waypoint_generation()
+        self.load_path_smoothing()
         self.load_replanning()
 
     def load_frontier_detection(self):
@@ -154,6 +155,36 @@ class PlanningConfig:
             section.get("waypoint_spacing_m"),
             "waypoint_generation.waypoint_spacing_m"
         )
+
+    def load_path_smoothing(self):
+        section = self._config.get("path_smoothing")
+
+        if section is None:
+            raise ValueError(
+                "Missing 'path_smoothing' section in "
+                f"{self.config_path}."
+            )
+
+        self.cost_increase_tolerance = section.get("cost_increase_tolerance")
+
+        if self.cost_increase_tolerance is None:
+            raise ValueError(
+                "Missing 'path_smoothing.cost_increase_tolerance' in "
+                f"{self.config_path}."
+            )
+
+        if not isinstance(self.cost_increase_tolerance, (int, float)):
+            raise ValueError(
+                "path_smoothing.cost_increase_tolerance must be a "
+                "numeric value."
+            )
+
+        if self.cost_increase_tolerance < 0:
+            raise ValueError(
+                "path_smoothing.cost_increase_tolerance must be >= 0."
+            )
+
+        self.cost_increase_tolerance = float(self.cost_increase_tolerance)
 
     def load_replanning(self):
         section = self._config.get("replanning")

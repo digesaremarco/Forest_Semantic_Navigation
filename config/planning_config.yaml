@@ -70,6 +70,16 @@ waypoint_generation:
   # controller, in meters.
   waypoint_spacing_m: 0.5
 
+path_smoothing:
+  # A straight-line shortcut through the A* path is only accepted if
+  # its average traversability cost is no more than this fraction
+  # higher than the average cost of the original path segment it
+  # would replace (0.1 = shortcut can be up to 10% costlier on
+  # average). Prevents a purely geometric smoother from "cutting the
+  # corner" through free-but-costly terrain that A* deliberately
+  # routed around.
+  cost_increase_tolerance: 0.1
+
 replanning:
   # Trigger a replan once the robot is within this distance (meters)
   # of the current goal.
@@ -77,4 +87,4 @@ replanning:
 
   # Trigger a replan if this many seconds pass without reaching the
   # goal.
-  timeout_s: 50.0
+  timeout_s: 30.0
