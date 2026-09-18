@@ -1,0 +1,80 @@
+# Planning configuration.
+#
+# Parameters for frontier-based exploration driven by the fused
+# traversability cost (C_total from TraversabilityPipeline). See the
+# planning/ module docstrings for the full pipeline: frontier
+# detection -> refinement (mean-shift) -> selection (utility) ->
+# A* path planning -> smoothing -> waypoint quantization.
+
+frontier_detection:
+  # Cost threshold separating free (< threshold) from occupied
+  # (>= threshold) cells, applied to C_total in [0, 1].
+  occupied_threshold: 0.7
+
+  # Cells within this many grid cells of the STATIC grid's own
+  # border are excluded from frontier detection -- the grid edge is
+  # a limit of the data structure, not a real unexplored boundary of
+  # the world. Treating it as a frontier would pull the robot toward
+  # the area where GridMap already starts dropping out-of-bounds
+  # points. Set this to define how much margin you want to keep
+  # around the edge of your field-test area.
+  border_margin_cells: 10
+
+  # Minimum number of cells in a connected frontier cluster to keep
+  # it; smaller clusters are discarded as noise.
+  min_cluster_size: 5
+
+frontier_refinement:
+  # Mean-shift bandwidth (radius, in cells) used to shift each
+  # frontier centroid toward a lower-cost nearby area.
+  mean_shift_bandwidth_cells: 5
+
+  # Maximum distance (in cells) a centroid is allowed to move from
+  # its original position -- keeps the mean-shift from drifting the
+  # target so far into known low-cost area that it stops pointing
+  # toward the original frontier's unexplored direction.
+  max_shift_cells: 8
+
+frontier_selection:
+  # Radius (in cells) for the information-gain proxy: number of
+  # unknown cells within this radius of a candidate frontier.
+  information_gain_radius_cells: 15
+
+  # utility = beta_gain * normalized_information_gain
+  #         - beta_cost * normalized_navigation_cost
+  # Free-standing weights (not required to sum to 1): raise beta_cost
+  # relative to beta_gain to bias selection toward cheaper-to-reach
+  # frontiers over ones that simply reveal more unknown area.
+  beta_gain: 1.0
+  beta_cost: 1.0
+
+path_planning:
+  # A* edge cost = weight_distance * step_distance
+  #              + weight_traversability * cell_cost (C_total)
+  # Free-standing weights, not required to sum to 1: step_distance
+  # (meters) and cell_cost ([0,1]) are on different natural scales,
+  # so the right balance depends on grid resolution and how strongly
+  # you want to penalize costly cells vs. take the geometrically
+  # shortest route. Tune empirically.
+  weight_distance: 0.5
+  weight_traversability: 0.5
+
+  # Cost substituted for cells with no traversability data (NaN) in
+  # C_total, so A* doesn't treat them as impassable -- frontiers sit
+  # right at the edge of unobserved regions, so some NaN cells must
+  # remain crossable. In [0, 1], same scale as C_total.
+  nan_cost_penalty: 0.5
+
+waypoint_generation:
+  # Target spacing between consecutive waypoints sent to Spot's
+  # controller, in meters.
+  waypoint_spacing_m: 0.5
+
+replanning:
+  # Trigger a replan once the robot is within this distance (meters)
+  # of the current goal.
+  goal_reached_distance_m: 0.3
+
+  # Trigger a replan if this many seconds pass without reaching the
+  # goal.
+  timeout_s: 50.0
