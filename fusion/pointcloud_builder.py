@@ -58,7 +58,7 @@ import cv2
 import numpy as np
 
 from perception.segformer_inference import SegFormerInference
-from perception.semantic_cost import ClassReducer
+from perception.class_reducer import ClassReducer
 
 
 class PointCloudBuilder:
@@ -171,6 +171,7 @@ class PointCloudBuilder:
         valid_depth = (
             np.isfinite(depth_meters)
             & (depth_meters > 0)
+            & (depth_meters < 4.0)
         )
 
         if not np.any(valid_depth):
@@ -377,3 +378,4 @@ class PointCloudBuilder:
             raise TypeError(
                 "Depth image must contain numeric values."
             )
+
