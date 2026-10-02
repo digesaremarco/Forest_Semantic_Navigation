@@ -44,8 +44,8 @@ from bosdyn.client.image import ImageClient
 # Credentials are read from the standard bosdyn environment variables
 # if set, so they don't have to be written in the code.
 ROBOT_HOSTNAME = os.environ.get("SPOT_HOSTNAME", "192.168.50.3")
-ROBOT_USERNAME = os.environ.get("BOSDYN_CLIENT_USERNAME", "user")
-ROBOT_PASSWORD = os.environ.get("BOSDYN_CLIENT_PASSWORD", "pwd")
+ROBOT_USERNAME = os.environ.get("BOSDYN_CLIENT_USERNAME", "admin")
+ROBOT_PASSWORD = os.environ.get("BOSDYN_CLIENT_PASSWORD", "canerobotdacciaio")
 
 CAMERAS = ["frontleft", "frontright", "left", "right", "back"]
 
