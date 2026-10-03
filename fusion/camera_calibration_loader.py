@@ -4,13 +4,6 @@ Loads the real multi-camera calibration produced on the robot
 yaml) and exposes, per camera, the intrinsics and the static
 body -> camera extrinsic needed everywhere else in the project.
 
-Replaces BOTH of the previous loaders:
-  - CameraConfig (fusion/camera_config_loader.py): placeholder,
-    single-camera intrinsics.
-  - CameraExtrinsicsConfig (fusion/camera_extrinsics_loader.py):
-    single-camera extrinsics, flat YAML schema incompatible with
-    the real nested file.
-
 Scope: only the 4 confirmed cameras are loaded by default
 (frontleft, frontright, left, right) -- "back" is present in the
 real file but intentionally excluded.
