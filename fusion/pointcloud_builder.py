@@ -52,6 +52,22 @@ later be used to compute the semantic traversability cost.
 At this stage the point cloud is expressed in the depth-camera
 coordinate frame. Robot/world transformations are handled later
 by the pose provider.
+
+CAMERA-AWARE: intrinsics and depth_scale are NOT fixed at
+construction time anymore. One PointCloudBuilder is shared across
+however many cameras are active (1, 2 or 4), and build() looks up
+the right camera's calibration by name on every call, from the
+shared CameraCalibrationConfig (fusion/camera_calibration_loader.py).
+
+DEPTH SCALE: Spot reports depth_scale as a DIVISOR --
+    depth_meters = raw_value / depth_scale
+(see fusion/query_camera_extrinsics.py's own comment: "raw uint16
+value / depth_scale = depth in meters"). The real calibration gives
+depth_scale = 999.0 for every camera. This module used to multiply
+by depth_scale, which was fine with a placeholder value shaped like
+a meters-per-unit factor (e.g. 0.001) but silently produces
+nonsense (depth inflated ~1000x) with the real value -- fixed to
+divide.
 """
 
 import cv2
@@ -63,9 +79,9 @@ from perception.class_reducer import ClassReducer
 
 class PointCloudBuilder:
 
-    def __init__(self, perception_config, camera_config):
+    def __init__(self, perception_config, camera_calibration):
         self.perception_config = perception_config
-        self.camera_config = camera_config
+        self.camera_calibration = camera_calibration
 
         self.segformer = SegFormerInference(
             perception_config
@@ -75,18 +91,9 @@ class PointCloudBuilder:
             perception_config
         )
 
-        # Depth camera intrinsics
-        intrinsics = camera_config.get_depth_intrinsics()
-
-        self.fx = float(intrinsics["fx"])
-        self.fy = float(intrinsics["fy"])
-        self.cx = float(intrinsics["cx"])
-        self.cy = float(intrinsics["cy"])
-
-        # Depth scale
-        self.depth_scale = float(
-            camera_config.get_depth_scale()
-        )
+        # Intrinsics and depth_scale are no longer fixed here: with
+        # several cameras sharing one builder, they are looked up
+        # per camera on every build() call (see get_camera_params()).
 
         # Build the semantic palette corresponding to the filtered classes
         self.semantic_palette = self.build_semantic_palette()
@@ -98,7 +105,28 @@ class PointCloudBuilder:
         """
         return self.class_reducer.get_filtered_class_colors()
 
-    def build(self, rgb_image, depth_image):
+    def get_camera_params(self, camera_name):
+        """
+        Look up one camera's intrinsics + depth_scale from the
+        shared CameraCalibrationConfig.
+
+        Returns
+        -------
+        fx, fy, cx, cy, depth_scale : float
+        """
+
+        intrinsics = self.camera_calibration.get_intrinsics(camera_name)
+        depth_scale = self.camera_calibration.get_depth_scale(camera_name)
+
+        return (
+            float(intrinsics["fx"]),
+            float(intrinsics["fy"]),
+            float(intrinsics["cx"]),
+            float(intrinsics["cy"]),
+            float(depth_scale)
+        )
+
+    def build(self, rgb_image, depth_image, camera_name):
         """
         Build a semantic point cloud from an RGB image and
         its corresponding depth image.
@@ -110,6 +138,11 @@ class PointCloudBuilder:
 
         depth_image : numpy.ndarray
             Raw depth image with shape (H, W).
+
+        camera_name : str
+            Which camera this (rgb_image, depth_image) pair came
+            from (e.g. "right"), used to look up that camera's
+            intrinsics/depth_scale in camera_calibration.
 
         Returns
         -------
@@ -129,8 +162,9 @@ class PointCloudBuilder:
         self.validate_rgb_image(rgb_image)
         self.validate_depth_image(depth_image)
 
-        depth_height, depth_width = depth_image.shape[:2]
+        fx, fy, cx, cy, depth_scale = self.get_camera_params(camera_name)
 
+        depth_height, depth_width = depth_image.shape[:2]
 
         # SegFormer inference
         probabilities = self.segformer.infer(
@@ -161,10 +195,13 @@ class PointCloudBuilder:
                 depth_height
             )
 
-        # Convert depth to meters
+        # Convert depth to meters.
+        #
+        # depth_scale is a DIVISOR (raw_value / depth_scale =
+        # meters), not a multiplier -- see module docstring.
         depth_meters = (
             depth_image.astype(np.float32)
-            * self.depth_scale
+            / depth_scale
         )
 
         # Valid depth mask
@@ -188,15 +225,15 @@ class PointCloudBuilder:
         # Y = (v - cy) * Z / fy
         # Z = Z
         x = (
-            (u.astype(np.float32) - self.cx)
+            (u.astype(np.float32) - cx)
             * z
-            / self.fx
+            / fx
         )
 
         y = (
-            (v.astype(np.float32) - self.cy)
+            (v.astype(np.float32) - cy)
             * z
-            / self.fy
+            / fy
         )
 
         points_xyz = np.column_stack(
@@ -379,3 +416,278 @@ class PointCloudBuilder:
                 "Depth image must contain numeric values."
             )
 
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from PIL import Image
+
+# ---------------------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+sys.path.append(str(PROJECT_ROOT))
+
+from perception.perception_config_loader import PerceptionConfig
+from fusion.camera_calibration_loader import CameraCalibrationConfig
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # -------------------------------------------------------------
+    # Configuration
+    # -------------------------------------------------------------
+
+    perception_config_path = (
+        PROJECT_ROOT / "config" / "perception_config.yaml"
+    )
+
+    camera_intrinsics_path = (
+        PROJECT_ROOT / "config" / "camera_intrinsics.yaml"
+    )
+
+    # Which camera this test frame came from -- change this if you
+    # are testing a different camera's pair of images.
+    camera_name = "right"
+
+    rgb_path = (
+        PROJECT_ROOT / "testset" / "paired_images" / "000000.jpg"
+    )
+
+    depth_path = (
+        PROJECT_ROOT / "testset" / "paired_depths" / "000000.png"
+    )
+
+    # -------------------------------------------------------------
+    # Load configuration
+    # -------------------------------------------------------------
+
+    perception_config = PerceptionConfig(
+        perception_config_path
+    )
+
+    camera_calibration = CameraCalibrationConfig(
+        camera_intrinsics_path
+    )
+
+    # -------------------------------------------------------------
+    # Create point cloud builder
+    # -------------------------------------------------------------
+
+    builder = PointCloudBuilder(
+        perception_config,
+        camera_calibration
+    )
+
+    # -------------------------------------------------------------
+    # Load RGB and depth
+    # -------------------------------------------------------------
+
+    rgb_image = np.array(
+        Image.open(rgb_path).convert("RGB")
+    )
+
+    depth_image = np.array(
+        Image.open(depth_path)
+    )
+
+    #rgb_image = np.rot90(rgb_image, k=-1)
+    #depth_image = np.rot90(depth_image, k=-1)
+
+    print("RGB shape:   ", rgb_image.shape)
+    print("Depth shape: ", depth_image.shape)
+
+    # -------------------------------------------------------------
+    # Build semantic point cloud
+    # -------------------------------------------------------------
+
+    pointcloud = builder.build(
+        rgb_image,
+        depth_image,
+        camera_name
+    )
+
+    # -------------------------------------------------------------
+    # Extract outputs
+    # -------------------------------------------------------------
+
+    points_xyz = pointcloud["points_xyz"]
+    semantic_colors = pointcloud["semantic_colors"]
+    semantic_probs = pointcloud["semantic_probs"]
+
+    # -------------------------------------------------------------
+    # Print results
+    # -------------------------------------------------------------
+
+    print("\nPoint cloud generated")
+
+    print("XYZ shape:             ", points_xyz.shape)
+    print("Semantic colors shape: ", semantic_colors.shape)
+    print("Semantic probs shape:  ", semantic_probs.shape)
+
+    print("\nFirst 5 points:")
+    print(points_xyz[:5])
+
+    print("\nFirst 5 semantic colors:")
+    print(semantic_colors[:5])
+
+    print("\nFirst 5 semantic probabilities:")
+    print(semantic_probs[:5])
+
+    # -------------------------------------------------------------
+    # Basic consistency checks
+    # -------------------------------------------------------------
+
+    assert points_xyz.shape[0] == semantic_colors.shape[0]
+    assert points_xyz.shape[0] == semantic_probs.shape[0]
+
+    assert points_xyz.shape[1] == 3
+    assert semantic_colors.shape[1] == 3
+
+    print("\nAll consistency checks passed.")
+
+    # -------------------------------------------------------------
+    # Reconstruct segmentation mask
+    # -------------------------------------------------------------
+
+    semantic_class_ids = np.argmax(
+        semantic_probs,
+        axis=1
+    )
+
+    # -------------------------------------------------------------
+    # Create semantic image
+    # -------------------------------------------------------------
+    #
+    # The point cloud only contains pixels with valid depth.
+    # Therefore, we reconstruct an image-sized mask using the
+    # original RGB/depth resolution.
+    #
+    # -------------------------------------------------------------
+
+    height, width = depth_image.shape[:2]
+
+    semantic_image = np.zeros(
+        (height, width, 3),
+        dtype=np.uint8
+    )
+
+    # -------------------------------------------------------------
+    # Project valid semantic colors back into image coordinates
+    # -------------------------------------------------------------
+
+    # Reconstruct the valid-depth mask
+    valid_depth = (
+        np.isfinite(depth_image)
+        & (depth_image > 0)
+    )
+
+    valid_v, valid_u = np.where(valid_depth)
+
+    # If the point cloud was generated from exactly the same
+    # depth pixels, their order corresponds to these coordinates.
+    semantic_image[valid_v, valid_u] = semantic_colors
+
+    # -------------------------------------------------------------
+    # Visualize RGB + segmentation + point cloud
+    # -------------------------------------------------------------
+
+    fig = plt.figure(figsize=(18, 6))
+
+    # -------------------------------------------------------------
+    # Original RGB
+    # -------------------------------------------------------------
+
+    ax1 = fig.add_subplot(1, 3, 1)
+
+    ax1.imshow(rgb_image)
+
+    ax1.set_title("RGB Image")
+    ax1.axis("off")
+
+    # -------------------------------------------------------------
+    # Semantic segmentation
+    # -------------------------------------------------------------
+
+    ax2 = fig.add_subplot(1, 3, 2)
+
+    ax2.imshow(semantic_image)
+
+    ax2.set_title("Semantic Segmentation")
+    ax2.axis("off")
+
+    # -------------------------------------------------------------
+    # Semantic point cloud
+    # -------------------------------------------------------------
+
+    ax3 = fig.add_subplot(
+        1,
+        3,
+        3,
+        projection="3d"
+    )
+
+    if len(points_xyz) > 0:
+
+        ax3.scatter(
+            points_xyz[:, 0],
+            points_xyz[:, 1],
+            points_xyz[:, 2],
+            c=semantic_colors / 255.0,
+            s=1
+        )
+
+    ax3.set_xlabel("X")
+    ax3.set_ylabel("Y")
+    ax3.set_zlabel("Z")
+
+    ax3.set_title("Semantic Point Cloud")
+
+    plt.tight_layout()
+    plt.show()
+
+    # -------------------------------------------------------------
+    # Print struttura di un singolo punto
+    # -------------------------------------------------------------
+
+    if len(points_xyz) > 0:
+
+        point_id = 0
+
+        print("\nStruttura del punto", point_id)
+        print("--------------------------------")
+
+        print("XYZ:")
+        print("  ", points_xyz[point_id])
+        print("  dtype:", points_xyz.dtype)
+        print("  shape:", points_xyz[point_id].shape)
+
+        print("\nSemantic color:")
+        print("  ", semantic_colors[point_id])
+        print("  dtype:", semantic_colors.dtype)
+        print("  shape:", semantic_colors[point_id].shape)
+
+        print("\nSemantic probabilities:")
+        print("  ", semantic_probs[point_id])
+        print("  dtype:", semantic_probs.dtype)
+        print("  shape:", semantic_probs[point_id].shape)
+
+        # Classe semantica predetta
+        semantic_class_id = np.argmax(
+            semantic_probs[point_id]
+        )
+
+        print("\nPredicted semantic class ID:")
+        print("  ", semantic_class_id)
+
+    else:
+        print("\nPoint cloud vuota.")

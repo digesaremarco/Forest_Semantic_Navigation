@@ -31,18 +31,18 @@ class TraversabilityPipeline:
     def __init__(
         self,
         perception_config,
-        camera_config,
+        camera_calibration,
         grid_map_config,
         costmap_config
     ):
         self.perception_config = perception_config
-        self.camera_config = camera_config
+        self.camera_calibration = camera_calibration
         self.grid_map_config = grid_map_config
         self.costmap_config = costmap_config
 
         self.class_reducer = ClassReducer(perception_config)
         self.point_cloud_builder = PointCloudBuilder(
-            perception_config, camera_config
+            perception_config, camera_calibration
         )
 
         # Public: downstream code (visualization, diagnostics) is
@@ -54,7 +54,7 @@ class TraversabilityPipeline:
         self.semantic_cost = SemanticCost(costmap_config, self.class_reducer)
         self.cost_fusion = CostFusion(costmap_config)
 
-    def update(self, rgb, depth, R, t):
+    def update(self, rgb, depth, R, t, camera_name):
         """
         Process one frame: run semantic segmentation + point cloud
         construction on (rgb, depth), then fuse the result into the
@@ -76,9 +76,16 @@ class TraversabilityPipeline:
             Shape (3,). Sensor position in the world/odom frame. On
             the very first call, this position anchors the grid
             (see GridMap).
+
+        camera_name : str
+            Which camera (rgb, depth) came from (e.g. "right"),
+            looked up in camera_calibration for the right
+            intrinsics/depth_scale. Several cameras can share one
+            TraversabilityPipeline/GridMap: just call update() once
+            per camera per timestep, with that camera's name.
         """
 
-        pc = self.point_cloud_builder.build(rgb, depth)
+        pc = self.point_cloud_builder.build(rgb, depth, camera_name)
 
         points_xyz = pc["points_xyz"].astype(np.float32, copy=False)
         semantic_colors = pc["semantic_colors"].astype(np.uint8, copy=False)
