@@ -19,11 +19,11 @@ CAMERA POSE vs BODY POSE: the odometry log only records the robot
 BODY's pose (odom_tform_body), not the camera's own pose. By
 default, pair() returns that body pose directly, used as an
 approximation of the camera pose (the placeholder used everywhere in
-this project so far). If a CameraExtrinsicsConfig is provided (the
-static body -> camera offset produced by
-fusion/query_camera_extrinsics.py), pair() instead composes it with
-each frame's body pose to return the TRUE camera pose in the odom
-frame:
+this project so far). If a CameraCalibrationConfig + camera_name are
+provided (the static body -> camera offset produced on the robot,
+see fusion/camera_calibration_loader.py), pair() instead composes it
+with each frame's body pose to return the TRUE camera pose in the
+odom frame:
 
     R_odom_camera = R_odom_body @ R_body_camera
     t_odom_camera = R_odom_body @ t_body_camera + t_odom_body
@@ -61,15 +61,16 @@ class FramePosePairer:
         depth_dir,
         pose_csv_path,
         max_pose_dt=1.0,
-        camera_extrinsics=None
+        camera_calibration=None,
+        camera_name=None
     ):
         """
         Parameters
         ----------
         rgb_dir, depth_dir : str or Path
             Directories containing the RGB (.jpg) and depth (.png)
-            frames. Files are matched across the two directories by
-            the timestamp embedded in their filename
+            frames for ONE camera. Files are matched across the two
+            directories by the timestamp embedded in their filename
             (YYYYMMDD_HHMMSS_ffffff, 6-digit microseconds).
 
         pose_csv_path : str or Path
@@ -81,17 +82,44 @@ class FramePosePairer:
             Time gap, in seconds, past which a frame<->pose match
             triggers a warning instead of being accepted silently.
 
-        camera_extrinsics : CameraExtrinsicsConfig, optional
-            The static body -> camera transform. If given, pair()
-            returns the true camera pose (composed with each frame's
-            body pose) instead of the body pose directly.
+        camera_calibration : CameraCalibrationConfig, optional
+            The multi-camera calibration (fusion/
+            camera_calibration_loader.py). If given, camera_name
+            must be given too: pair() then looks up that camera's
+            static body -> camera extrinsic and returns the true
+            camera pose (composed with each frame's body pose)
+            instead of the body pose directly.
+
+        camera_name : str, optional
+            Which camera this instance's rgb_dir/depth_dir belong
+            to (e.g. "right"), looked up in camera_calibration.
+            Required together with camera_calibration -- one
+            FramePosePairer instance still handles one camera's
+            frames; for several cameras, build one instance per
+            camera (same camera_calibration, different
+            rgb_dir/depth_dir/camera_name).
         """
 
         self.rgb_dir = Path(rgb_dir)
         self.depth_dir = Path(depth_dir)
         self.pose_csv_path = Path(pose_csv_path)
         self.max_pose_dt = max_pose_dt
-        self.camera_extrinsics = camera_extrinsics
+        self.camera_name = camera_name
+
+        if (camera_calibration is None) != (camera_name is None):
+            raise ValueError(
+                "camera_calibration and camera_name must be given "
+                "together (both, or neither for the body-pose "
+                "placeholder)."
+            )
+
+        if camera_calibration is None:
+            self.R_body_camera = None
+            self.t_body_camera = None
+        else:
+            self.R_body_camera, self.t_body_camera = (
+                camera_calibration.get_extrinsics(camera_name)
+            )
 
         if not self.rgb_dir.exists():
             raise FileNotFoundError(
@@ -280,7 +308,8 @@ class FramePosePairer:
         Run the full pairing: load poses, group RGB/depth frames,
         and attach the closest pose to each -- composed with the
         camera extrinsics into the true camera pose, if a
-        CameraExtrinsicsConfig was provided at construction time.
+        camera_calibration/camera_name was provided at construction
+        time.
 
         Returns
         -------
@@ -311,7 +340,7 @@ class FramePosePairer:
                     "anyway -- check for gaps in the odometry log."
                 )
 
-            if self.camera_extrinsics is None:
+            if self.R_body_camera is None:
                 # Placeholder: body pose used directly as the
                 # camera's pose.
                 R, t = R_body, t_body
@@ -320,7 +349,7 @@ class FramePosePairer:
                 # the static body_tform_camera.
                 R, t = compose_poses(
                     R_body, t_body,
-                    self.camera_extrinsics.R, self.camera_extrinsics.t
+                    self.R_body_camera, self.t_body_camera
                 )
 
             results.append({
@@ -336,8 +365,8 @@ class FramePosePairer:
 
         pose_kind = (
             "body pose (placeholder)"
-            if self.camera_extrinsics is None
-            else "true camera pose"
+            if self.R_body_camera is None
+            else f"true camera pose ({self.camera_name})"
         )
 
         print(
@@ -375,16 +404,19 @@ class FramePosePairer:
 
 if __name__ == "__main__":
 
-    from fusion.camera_extrinsics_loader import CameraExtrinsicsConfig
+    from fusion.camera_calibration_loader import CameraCalibrationConfig
+
+    camera_calibration = CameraCalibrationConfig(
+        PROJECT_ROOT / "config" / "camera_intrinsics.yaml"
+    )
 
     pairer = FramePosePairer(
         rgb_dir=PROJECT_ROOT / "testset" / "images",
         depth_dir=PROJECT_ROOT / "testset" / "depths",
         pose_csv_path=PROJECT_ROOT / "testset" / "pose" / "odometry_log.csv",
         max_pose_dt=1.0,
-        camera_extrinsics=CameraExtrinsicsConfig(
-             PROJECT_ROOT / "config" / "camera_extrinsics.yaml"
-        ),  # uncomment once you have this file
+        camera_calibration=camera_calibration,
+        camera_name="right"
     )
 
     paired_frames = pairer.pair()
