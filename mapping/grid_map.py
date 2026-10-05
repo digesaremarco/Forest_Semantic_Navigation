@@ -17,8 +17,9 @@ Pipeline:
     GridMap.update()
         |
         v
-    elevation / rgb / semantic_probs / count
-    (one static grid, 4 aligned layers)
+    elevation / elevation_variance / roughness /
+    rgb / semantic_probs / count
+    (one static grid, aligned layers)
 
 Design choices (see conversation history for the reasoning):
 
@@ -31,26 +32,66 @@ Design choices (see conversation history for the reasoning):
   at this scale (a fixed ~20x20 m field-test area), where the
   memory savings of a rolling buffer are not needed.
 
+- Per-point measurement noise depends on the DEPTH z of the point
+  along the camera optical axis (points_xyz[:, 2], since points_xyz
+  is in the camera optical frame):
+
+      sigma^2(z) = sigma0^2 + alpha * z^p
+
+  Stereo depth error comes from disparity error, so it is a function
+  of z, not of the 3D Euclidean distance. With Spot's wide-FOV
+  cameras the two differ a lot off-axis (on the test set: p99 depth
+  3.7 m vs p99 distance 4.6 m). Using z also keeps the model
+  consistent with the point cloud pre-filter, which cuts on z at
+  4 m.
+
+  The parameters come from the 'noise' section of
+  grid_map_config.yaml (via GridMapConfig) and were calibrated with
+  fit_depth_noise.py: per-pixel temporal variance over frames with
+  Spot standing still, median per depth bin, fit on the relative
+  error. The log-log slope of sigma vs z was 2.01 (stereo theory:
+  2.0), confirming p = 4; alpha = 1.7e-5. The fitted sigma0 was ~0;
+  the configured sigma0 (3 mm) is a deliberate conservative floor
+  for errors the temporal method cannot observe (calibration, pose
+  error, systematic bias), which also prevents very close points
+  from getting near-infinite weight. Setting alpha = 0 makes every
+  point equally weighted and reproduces the plain-mean behavior
+  exactly.
+
+  Weights are normalized to the reference depth z_ref:
+
+      w = sigma^2(z_ref) / sigma^2(z)
+
+  so w = 1 at z_ref, and accumulated weights keep the meaning of
+  "equivalent number of observations at z_ref".
+
 - Fusion across frames follows the MEM paper's two closed-form,
   "no forgetting" special cases (Sec. III-C):
-    * elevation, rgb: Bayesian inference of Gaussians (Eq. 3-7)
-      with EQUAL, CONSTANT variance for every point. Under that
-      assumption the closed-form posterior mean degenerates to a
-      plain running mean weighted by observation count -- so it is
-      implemented as a running sum + count, divided lazily in the
-      getters (avoids incremental floating-point drift).
+    * elevation, rgb: Bayesian inference of Gaussians (Eq. 3-7).
+      With independent Gaussian measurements of variance sigma_i^2,
+      the posterior mean is the inverse-variance weighted mean
+      sum(w_i z_i) / sum(w_i), and the posterior variance is
+      1 / sum(1 / sigma_i^2) = sigma^2(z_ref) / sum(w_i). Both are
+      implemented as running sums divided lazily in the getters
+      (avoids incremental floating-point drift).
     * semantic_probs: Dirichlet Bayesian inference (Eq. 8-12) with
-      a flat/uninformative prior. The update rule is additive
-      (alpha_j,t = alpha_j,t-1 + sum of per-point probability
-      vectors), which is exactly a running sum of the softmax
-      channels -- so elevation/rgb and semantic_probs share the
-      same accumulation mechanism, only the normalization at
-      read-time differs conceptually (it isn't, mathematically:
-      both are "sum divided by count").
+      a flat/uninformative prior. The update rule is additive; here
+      each point's probability vector is scaled by its weight w, so
+      a far, noisy point contributes less evidence than a near one.
+      Since each probability vector sums to 1, sum_j alpha_j equals
+      sum(w), so dividing by the weight sum yields a normalized
+      distribution.
   Exponential averaging (Eq. 2, which deliberately forgets old
   data) is NOT implemented: it's the right choice for dynamic
   scenes or continuous drift, neither of which applies to a single,
   static field-test session.
+
+- The posterior elevation variance is OPTIMISTIC: points from the
+  same frame share correlated errors (stereo bias, pose error), so
+  they are not truly independent. Treat it as a relative confidence
+  measure, not a calibrated one. The separate roughness layer
+  (weighted empirical variance of heights inside a cell) measures
+  real height spread (grass, rocks), not estimation uncertainty.
 
 - Cells never observed are NaN in every layer, not zero: zero is a
   valid observed value (e.g. z=0, or a class probability of 0), so
@@ -74,6 +115,24 @@ class GridMap:
         self.cell_n = self.grid_map_config.cell_n
         self.resolution = self.grid_map_config.resolution
 
+        # Depth noise model (see module docstring). Read directly:
+        # GridMapConfig always sets these attributes (with a warning
+        # and alpha = 0 if the 'noise' section is missing), so a
+        # missing attribute here means a wrong config object and
+        # should fail loudly, not fall back silently.
+        self.noise_sigma0 = float(self.grid_map_config.noise_sigma0)
+        self.noise_alpha = float(self.grid_map_config.noise_alpha)
+        self.noise_exponent = float(self.grid_map_config.noise_exponent)
+        self.noise_reference_distance = float(
+            self.grid_map_config.noise_reference_distance
+        )
+
+        self.validate_noise_params()
+
+        self.reference_variance = self.point_variance(
+            self.noise_reference_distance
+        )
+
         # Semantic channel order, fixed for the lifetime of this
         # GridMap: index i in semantic_probs / semantic_alpha
         # corresponds to self.class_names[i].
@@ -88,8 +147,10 @@ class GridMap:
         # initialized", not "at the world origin".
         self.origin = None
 
-        self.elevation_sum = None
-        self.rgb_sum = None
+        self.weight_sum = None
+        self.elevation_wsum = None
+        self.elevation_wsum2 = None
+        self.rgb_wsum = None
         self.semantic_alpha = None
         self.count = None
 
@@ -108,22 +169,74 @@ class GridMap:
 
         shape_2d = (self.cell_n, self.cell_n)
 
-        self.elevation_sum = np.zeros(shape_2d, dtype=np.float32)
-        self.rgb_sum = np.zeros((*shape_2d, 3), dtype=np.float32)
+        # Elevation accumulators in float64: the roughness layer is
+        # computed as E[z^2] - E[z]^2, which suffers from
+        # cancellation in float32.
+        self.weight_sum = np.zeros(shape_2d, dtype=np.float64)
+        self.elevation_wsum = np.zeros(shape_2d, dtype=np.float64)
+        self.elevation_wsum2 = np.zeros(shape_2d, dtype=np.float64)
+
+        self.rgb_wsum = np.zeros((*shape_2d, 3), dtype=np.float32)
 
         self.semantic_alpha = np.zeros(
             (*shape_2d, self.num_classes),
             dtype=np.float32
         )
 
+        # Raw number of points per cell (unweighted), kept for
+        # diagnostics.
         self.count = np.zeros(shape_2d, dtype=np.float32)
 
         print(
             f"[GridMap] Initialized {self.cell_n}x{self.cell_n} grid "
             f"({self.grid_map_config.map_length} m, "
             f"{self.resolution} m/cell), "
-            f"origin anchored at {self.origin}."
+            f"origin anchored at {self.origin}. "
+            f"Noise model: sigma^2 = {self.noise_sigma0}^2 + "
+            f"{self.noise_alpha} * z^{self.noise_exponent} "
+            f"(z_ref = {self.noise_reference_distance} m)."
         )
+
+    def point_variance(self, depth):
+        """
+        Measurement variance [m^2] of a point at the given depth z
+        [m] along the camera optical axis. Accepts scalars or numpy
+        arrays.
+        """
+
+        depth = np.asarray(depth, dtype=np.float64)
+
+        return (
+            self.noise_sigma0 ** 2
+            + self.noise_alpha * depth ** self.noise_exponent
+        )
+
+    def compute_point_weights(self, points_xyz):
+        """
+        Inverse-variance weight of each point, normalized so that a
+        point at depth noise_reference_distance has weight 1.
+
+        Parameters
+        ----------
+        points_xyz : numpy.ndarray
+            Shape (N, 3). Points in the camera OPTICAL frame
+            (x right, y down, z forward): column 2 is the depth z
+            the noise model was calibrated on. Passing points in any
+            other frame (e.g. body or world) silently produces wrong
+            weights.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (N,), float64, strictly positive.
+        """
+
+        # Depth along the optical axis, not the 3D distance: see the
+        # module docstring. abs() only guards against the sign; the
+        # pre-filter already keeps 0 < z < 4 m.
+        depth = np.abs(points_xyz[:, 2])
+
+        return self.reference_variance / self.point_variance(depth)
 
     def update(self, points_xyz, rgb, semantic_probs, R, t):
         """
@@ -132,7 +245,8 @@ class GridMap:
         Parameters
         ----------
         points_xyz : numpy.ndarray
-            Shape (N, 3). Point coordinates in the sensor frame.
+            Shape (N, 3). Point coordinates in the camera optical
+            frame (x right, y down, z forward).
 
         rgb : numpy.ndarray
             Shape (N, 3). Per-point RGB color, 0-255 range.
@@ -143,11 +257,11 @@ class GridMap:
             self.class_names.
 
         R : numpy.ndarray
-            Shape (3, 3). Sensor orientation in the world/odometry
+            Shape (3, 3). Camera orientation in the world/odometry
             frame.
 
         t : numpy.ndarray
-            Shape (3,). Sensor position in the world/odometry frame.
+            Shape (3,). Camera position in the world/odometry frame.
             On the very first call, this position anchors the grid.
         """
 
@@ -156,6 +270,10 @@ class GridMap:
 
         if not self.is_initialized():
             self.initialize_grid(t)
+
+        # Weights depend on the depth in the camera frame, so they
+        # must be computed BEFORE transforming to the world frame.
+        weights = self.compute_point_weights(points_xyz)
 
         points_world = self.transform_to_world(points_xyz, R, t)
 
@@ -178,9 +296,12 @@ class GridMap:
         if row_idx.size == 0:
             return
 
-        z_values = points_world[in_bounds, 2]
+        w = weights[in_bounds]
+        z_values = points_world[in_bounds, 2].astype(np.float64)
         rgb_values = rgb[in_bounds].astype(np.float32)
-        semantic_values = semantic_probs[in_bounds]
+        semantic_values = semantic_probs[in_bounds].astype(np.float32)
+
+        w32 = w.astype(np.float32)[:, None]
 
         # Flatten (row, col) into a single index so repeated indices
         # (multiple points in the same cell) accumulate correctly
@@ -188,32 +309,36 @@ class GridMap:
         # -- handles duplicate indices by summing, not overwriting.
         flat_idx = row_idx * self.cell_n + col_idx
 
+        np.add.at(self.weight_sum.reshape(-1), flat_idx, w)
+
         np.add.at(
-            self.elevation_sum.reshape(-1),
+            self.elevation_wsum.reshape(-1),
             flat_idx,
-            z_values
+            w * z_values
         )
 
         np.add.at(
-            self.rgb_sum.reshape(-1, 3),
+            self.elevation_wsum2.reshape(-1),
             flat_idx,
-            rgb_values
+            w * z_values * z_values
+        )
+
+        np.add.at(
+            self.rgb_wsum.reshape(-1, 3),
+            flat_idx,
+            rgb_values * w32
         )
 
         np.add.at(
             self.semantic_alpha.reshape(-1, self.num_classes),
             flat_idx,
-            semantic_values
+            semantic_values * w32
         )
 
-        np.add.at(
-            self.count.reshape(-1),
-            flat_idx,
-            1.0
-        )
+        np.add.at(self.count.reshape(-1), flat_idx, 1.0)
 
     def transform_to_world(self, points_xyz, R, t):
-        """Transform points from the sensor frame to the world frame."""
+        """Transform points from the camera frame to the world frame."""
 
         return points_xyz @ R.T + t
 
@@ -250,7 +375,7 @@ class GridMap:
 
     def get_elevation_layer(self):
         """
-        Return the elevation layer as a numpy array.
+        Return the elevation layer (inverse-variance weighted mean).
 
         Returns
         -------
@@ -259,7 +384,47 @@ class GridMap:
             observed.
         """
 
-        return self.safe_divide(self.elevation_sum, self.count)
+        return self.safe_divide(self.elevation_wsum, self.weight_sum)
+
+    def get_elevation_variance_layer(self):
+        """
+        Return the posterior variance of the elevation estimate,
+        sigma^2(z_ref) / sum(w). Optimistic (see module docstring):
+        use it as a relative confidence measure.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (H, W), float32, in m^2. NaN where the cell was
+            never observed.
+        """
+
+        return self.safe_divide(self.reference_variance, self.weight_sum)
+
+    def get_roughness_layer(self):
+        """
+        Return the weighted empirical variance of the heights fused
+        into each cell, E_w[z^2] - E_w[z]^2. Measures real height
+        spread inside the cell (vegetation, stones), not estimation
+        uncertainty. Zero for cells with a single point.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (H, W), float32, in m^2. NaN where the cell was
+            never observed.
+        """
+
+        observed = self.weight_sum > 0
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = self.elevation_wsum / self.weight_sum
+            variance = self.elevation_wsum2 / self.weight_sum - mean ** 2
+
+        # Clip tiny negative values from floating-point cancellation.
+        variance = np.where(observed, np.maximum(variance, 0.0), np.nan)
+
+        return variance.astype(np.float32)
 
     def get_rgb_layer(self):
         """
@@ -273,7 +438,7 @@ class GridMap:
             represent "unobserved"; round/cast at display time.
         """
 
-        return self.safe_divide(self.rgb_sum, self.count[..., None])
+        return self.safe_divide(self.rgb_wsum, self.weight_sum[..., None])
 
     def get_semantic_layer(self, class_name):
         """
@@ -302,7 +467,7 @@ class GridMap:
 
         return self.safe_divide(
             self.semantic_alpha[..., class_idx],
-            self.count
+            self.weight_sum
         )
 
     def get_semantic_probs_layer(self):
@@ -320,7 +485,7 @@ class GridMap:
         """
 
         return self.safe_divide(
-            self.semantic_alpha, self.count[..., None]
+            self.semantic_alpha, self.weight_sum[..., None]
         )
 
     def get_all_semantic_layers(self):
@@ -345,11 +510,25 @@ class GridMap:
         Returns
         -------
         numpy.ndarray
-            Shape (H, W), float32. Number of points fused into each
-            cell so far (0 for never-observed cells).
+            Shape (H, W), float32. Raw (unweighted) number of points
+            fused into each cell so far (0 for never-observed cells).
         """
 
         return self.count.copy()
+
+    def get_weight_layer(self):
+        """
+        Return the accumulated weight per cell.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (H, W), float32. Equivalent number of observations
+            at depth noise_reference_distance (0 for never-observed
+            cells).
+        """
+
+        return self.weight_sum.astype(np.float32)
 
     def get_origin(self):
         """
@@ -416,16 +595,15 @@ class GridMap:
     def save(self, path):
         """
         Save the grid's raw state to a compressed .npz file: the
-        accumulators (elevation_sum, rgb_sum, semantic_alpha, count)
-        plus the origin and enough metadata (cell_n, resolution,
-        class_names) to validate a later load() against a
-        compatible GridMap.
+        weighted accumulators plus the origin, the noise model and
+        enough metadata (cell_n, resolution, class_names) to validate
+        a later load() against a compatible GridMap.
 
         Saves the RAW accumulators, not the divided-out layers
         (get_elevation_layer() etc.) -- this keeps a loaded map
         mathematically able to keep fusing more frames afterward,
         and avoids baking "NaN for unobserved" into the file (it is
-        recomputed from count on read instead).
+        recomputed from the weights on read instead).
         """
 
         if not self.is_initialized():
@@ -440,13 +618,16 @@ class GridMap:
         np.savez_compressed(
             path,
             origin=self.origin,
-            elevation_sum=self.elevation_sum,
-            rgb_sum=self.rgb_sum,
+            weight_sum=self.weight_sum,
+            elevation_wsum=self.elevation_wsum,
+            elevation_wsum2=self.elevation_wsum2,
+            rgb_wsum=self.rgb_wsum,
             semantic_alpha=self.semantic_alpha,
             count=self.count,
             cell_n=np.array(self.cell_n),
             resolution=np.array(self.resolution),
-            class_names=np.array(self.class_names)
+            class_names=np.array(self.class_names),
+            noise_params=np.array(self.noise_params())
         )
 
         print(f"[GridMap] Saved grid state to {path}.")
@@ -461,6 +642,11 @@ class GridMap:
         loading a map saved with a different grid_map_config or a
         different retained-class set would otherwise silently
         misalign every cell/channel instead of failing loudly.
+
+        Files saved before the noise model existed (unweighted
+        accumulators) are still accepted: every old point is treated
+        as having weight 1, and the roughness of those cells is
+        unknown (set to 0).
         """
 
         path = Path(path)
@@ -469,13 +655,21 @@ class GridMap:
             raise FileNotFoundError(f"Grid map file not found: {path}")
 
         data = np.load(path, allow_pickle=False)
+        files = set(data.files)
 
-        required_keys = {
-            "origin", "elevation_sum", "rgb_sum", "semantic_alpha",
-            "count", "cell_n", "resolution", "class_names"
+        common_keys = {
+            "origin", "semantic_alpha", "count",
+            "cell_n", "resolution", "class_names"
         }
+        weighted_keys = {
+            "weight_sum", "elevation_wsum", "elevation_wsum2", "rgb_wsum"
+        }
+        legacy_keys = {"elevation_sum", "rgb_sum"}
 
-        missing = required_keys - set(data.files)
+        is_legacy = not (weighted_keys <= files) and legacy_keys <= files
+
+        expected = common_keys | (legacy_keys if is_legacy else weighted_keys)
+        missing = expected - files
 
         if missing:
             raise ValueError(
@@ -512,10 +706,44 @@ class GridMap:
             )
 
         self.origin = data["origin"].astype(np.float32)
-        self.elevation_sum = data["elevation_sum"].astype(np.float32)
-        self.rgb_sum = data["rgb_sum"].astype(np.float32)
         self.semantic_alpha = data["semantic_alpha"].astype(np.float32)
         self.count = data["count"].astype(np.float32)
+
+        if is_legacy:
+            self.weight_sum = data["count"].astype(np.float64)
+            self.elevation_wsum = data["elevation_sum"].astype(np.float64)
+
+            # Zero spread: E[z^2] = E[z]^2 for every observed cell.
+            with np.errstate(invalid="ignore", divide="ignore"):
+                self.elevation_wsum2 = np.where(
+                    self.weight_sum > 0,
+                    self.elevation_wsum ** 2 / self.weight_sum,
+                    0.0
+                )
+
+            self.rgb_wsum = data["rgb_sum"].astype(np.float32)
+
+            print(
+                f"[GridMap] WARNING: {path} uses the legacy unweighted "
+                "format; old points were given weight 1 and their "
+                "roughness is unknown."
+            )
+        else:
+            self.weight_sum = data["weight_sum"].astype(np.float64)
+            self.elevation_wsum = data["elevation_wsum"].astype(np.float64)
+            self.elevation_wsum2 = data["elevation_wsum2"].astype(np.float64)
+            self.rgb_wsum = data["rgb_wsum"].astype(np.float32)
+
+            if "noise_params" in files:
+                saved_noise = data["noise_params"].astype(np.float64)
+
+                if not np.allclose(saved_noise, self.noise_params()):
+                    print(
+                        "[GridMap] WARNING: saved noise model "
+                        f"{saved_noise.tolist()} differs from the "
+                        f"current one {self.noise_params()}; further "
+                        "fusion will mix inconsistent weights."
+                    )
 
         print(f"[GridMap] Loaded grid state from {path}.")
 
@@ -523,10 +751,51 @@ class GridMap:
         """Discard all fused data and un-anchor the grid."""
 
         self.origin = None
-        self.elevation_sum = None
-        self.rgb_sum = None
+        self.weight_sum = None
+        self.elevation_wsum = None
+        self.elevation_wsum2 = None
+        self.rgb_wsum = None
         self.semantic_alpha = None
         self.count = None
+
+    def noise_params(self):
+        """Noise model parameters, in a fixed order (for save/load)."""
+
+        return [
+            self.noise_sigma0,
+            self.noise_alpha,
+            self.noise_exponent,
+            self.noise_reference_distance
+        ]
+
+    def validate_noise_params(self):
+        """
+        Validate the noise model parameters. GridMapConfig already
+        validates them; this is a second check for config objects
+        built or modified elsewhere (e.g. the A/B copy in the test).
+        """
+
+        if self.noise_sigma0 <= 0:
+            raise ValueError(
+                "noise_sigma0 must be > 0 (it is the variance floor), "
+                f"got {self.noise_sigma0}."
+            )
+
+        if self.noise_alpha < 0:
+            raise ValueError(
+                f"noise_alpha must be >= 0, got {self.noise_alpha}."
+            )
+
+        if self.noise_exponent < 0:
+            raise ValueError(
+                f"noise_exponent must be >= 0, got {self.noise_exponent}."
+            )
+
+        if self.noise_reference_distance <= 0:
+            raise ValueError(
+                "noise_reference_distance must be > 0, got "
+                f"{self.noise_reference_distance}."
+            )
 
     def validate_points(self, points_xyz, rgb, semantic_probs):
         """Validate the point cloud arrays passed to update()."""
@@ -599,7 +868,7 @@ class GridMap:
         denominator is zero instead of raising or returning inf.
         """
 
-        denominator = np.asarray(denominator, dtype=np.float32)
+        denominator = np.asarray(denominator)
 
         with np.errstate(invalid="ignore", divide="ignore"):
             result = numerator / denominator
