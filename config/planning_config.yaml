@@ -63,7 +63,7 @@ path_planning:
   # C_total, so A* doesn't treat them as impassable -- frontiers sit
   # right at the edge of unobserved regions, so some NaN cells must
   # remain crossable. In [0, 1], same scale as C_total.
-  nan_cost_penalty: 0.5
+  nan_cost_penalty: 1.0
 
 waypoint_generation:
   # Target spacing between consecutive waypoints sent to Spot's

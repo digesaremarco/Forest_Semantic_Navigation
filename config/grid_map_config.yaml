@@ -62,3 +62,40 @@ noise:
 
   # Depth [m] at which a point has weight 1.
   reference_distance: 1.0
+
+# Vertical datum of the elevation layer.
+#
+# Point clouds are fused in the odom frame, whose z = 0 is NOT the
+# ground (Spot sets it at boot, roughly at body height): raw
+# elevations put the terrain around -0.5 m. With
+# mode: ground_first_frame, GridMap fits the ground plane on the
+# first frame(s), evaluates it below the camera, and returns
+# elevations relative to that height -- ground under the starting
+# pose = 0. Fixed ONCE: uphill cells get positive heights, as they
+# should. Raw accumulators stay in odom (the datum is applied in
+# get_elevation_layer() only), so it can be changed or re-estimated
+# later without re-fusing.
+#
+# The camera does not see the ground directly below the robot, so
+# the plane is fitted on a ring in front of it (min_range..max_range,
+# horizontal distance from the camera) and extrapolated.
+#
+# mode: none keeps raw odom heights.
+height_datum:
+  mode: ground_first_frame
+
+  # Horizontal distance [m] from the camera of the points used.
+  min_range: 0.5
+  max_range: 3.0
+
+  # RANSAC inlier distance [m] and number of iterations.
+  ransac_threshold: 0.03
+  ransac_iterations: 300
+
+  # Plane candidates steeper than this [deg] are rejected (tree
+  # trunks, rocks, walls); also the forest-slope limit at start.
+  max_tilt_deg: 30.0
+
+  # Minimum number of inliers for the estimate to be accepted; if
+  # not met, the next frames are tried until it is.
+  min_inliers: 500
