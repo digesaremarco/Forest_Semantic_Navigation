@@ -1,5 +1,11 @@
 """
 Visualization helpers for GridMap.
+
+Semantic plots color each cell by its WINNING class (argmax of the
+fused per-cell class probabilities) and carry a legend with one entry
+per class present. The rgb layer (running mean of palette colors) is
+still available via color_by="rgb", but mixed cells then get blended
+colors matching no class, so no legend is drawn in that mode.
 """
 
 import numpy as np
@@ -70,12 +76,14 @@ class GridMapVisualizer:
         self,
         ax=None,
         crop_to_observed=True,
-        background="white"
+        background="white",
+        color_by="class",
+        class_colors=None,
+        show_counts=True
     ):
         """
         Draw the GridMap seen from above (bird's-eye view) as a 2D
-        image, in world-frame meters: each observed cell is painted
-        with its semantic RGB color, unobserved cells are left
+        image, in world-frame meters. Unobserved cells are left
         transparent so the axis background shows through.
 
         Parameters
@@ -91,6 +99,17 @@ class GridMapVisualizer:
             Axis facecolor shown behind unobserved cells. None keeps
             Matplotlib's default.
 
+        color_by : {"class", "rgb"}
+            "class" (default): winning class color, with a legend.
+            "rgb": mean palette color of the cell, no legend.
+
+        class_colors : dict, optional
+            Per-class color overrides, {class_name: (r, g, b)} in
+            [0, 255] (color_by="class" only).
+
+        show_counts : bool
+            Append the number of cells to each legend entry.
+
         Returns
         -------
         (fig, ax)
@@ -98,32 +117,38 @@ class GridMapVisualizer:
 
         self.require_initialized()
 
-        count = self.grid_map.get_count_layer()
-        observed = count > 0
+        observed = self.grid_map.get_count_layer() > 0
 
         if not np.any(observed):
             raise RuntimeError(
                 "GridMap has no observed cells yet -- nothing to plot."
             )
 
-        rgb = self.grid_map.get_rgb_layer()
-
         row_slice, col_slice = self.resolve_crop(crop_to_observed)
-        rgb_view = rgb[row_slice, col_slice]
         observed_view = observed[row_slice, col_slice]
         extent = self.compute_extent(row_slice, col_slice)
 
-        # Build an RGBA image: colors in [0, 1], alpha = 0 where
-        # the cell has never been observed.
-        colors = np.nan_to_num(rgb_view.astype(np.float32), nan=0.0)
-        colors = np.clip(colors, 0, 255) / 255.0
-
+        # RGBA image: colors in [0, 1], alpha = 0 where unobserved.
         rgba = np.zeros(observed_view.shape + (4,), dtype=np.float32)
-        rgba[..., :3] = colors[..., :3]
         rgba[..., 3] = observed_view.astype(np.float32)
 
+        labels = None
+
+        if color_by == "class":
+            palette = self.get_class_palette(class_colors)
+            labels = self.get_winning_classes(observed_view, row_slice, col_slice)[0]
+            rgba[observed_view, :3] = palette[labels] / 255.0
+        elif color_by == "rgb":
+            rgb = self.grid_map.get_rgb_layer()[row_slice, col_slice]
+            colors = np.nan_to_num(rgb.astype(np.float32), nan=0.0)
+            rgba[..., :3] = np.clip(colors, 0, 255) / 255.0
+        else:
+            raise ValueError(
+                f"color_by must be 'class' or 'rgb', got {color_by!r}."
+            )
+
         if ax is None:
-            fig, ax = plt.subplots(figsize=(6, 6))
+            fig, ax = plt.subplots(figsize=(8, 7))
         else:
             fig = ax.figure
 
@@ -141,6 +166,9 @@ class GridMapVisualizer:
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
         ax.set_aspect("equal")
+
+        if labels is not None:
+            self.add_class_legend(ax, labels, palette, show_counts)
 
         return fig, ax
 
@@ -215,7 +243,6 @@ class GridMapVisualizer:
             )
 
         class_names = self.grid_map.class_names
-        probs = self.grid_map.get_semantic_probs_layer()
 
         rows, cols = np.nonzero(valid)
 
@@ -226,45 +253,13 @@ class GridMapVisualizer:
         obs = count[rows, cols]
 
         # Winning class per cell and its fused probability.
-        cell_probs = np.nan_to_num(probs[rows, cols], nan=0.0)
-        labels = np.argmax(cell_probs, axis=1)
-        confidence = cell_probs[np.arange(labels.size), labels]
+        labels, confidence = self.get_winning_classes(valid)
 
-        # ---------------------------------------------------------
-        # Resolve one color per class
-        # ---------------------------------------------------------
-
-        # Same channel order as class_names / semantic_probs.
-        palette = np.asarray(
-            self.grid_map.class_reducer.get_filtered_class_colors()
-        )
-
-        if palette.shape != (len(class_names), 3):
-            raise RuntimeError(
-                "ClassReducer palette has shape "
-                f"{palette.shape}, expected ({len(class_names)}, 3) "
-                "-- palette and GridMap channel order are out of sync."
-            )
+        palette = self.get_class_palette(class_colors)
 
         trace_colors = [
             f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in palette
         ]
-
-        # Optional per-class overrides.
-        if class_colors:
-            unknown = [n for n in class_colors if n not in class_names]
-
-            if unknown:
-                print(
-                    "[GridMapVisualizer] WARNING: class_colors has "
-                    f"names not in the GridMap: {unknown} "
-                    f"(available: {class_names})."
-                )
-
-            for k, name in enumerate(class_names):
-                if name in class_colors:
-                    r, g, b = (int(v) for v in class_colors[name])
-                    trace_colors[k] = f"rgb({r},{g},{b})"
 
         # ---------------------------------------------------------
         # One trace per class -> one legend entry per class
@@ -333,11 +328,26 @@ class GridMapVisualizer:
 
         return fig
 
-    def plot_semantic_3d(self, ax=None, point_size=2):
+    def plot_semantic_3d(
+        self,
+        ax=None,
+        point_size=1,
+        color_by="class",
+        class_colors=None,
+        show_counts=True,
+        equal_aspect=True,
+        max_points=150000,
+        seed=0
+    ):
         """
-        Draw a 3D scatter of observed cells: (x, y) in world-frame
-        meters, z = elevation, colored by the per-cell semantic
-        color layer.
+        Static Matplotlib 3D scatter of observed cells: (x, y) in
+        world-frame meters, z = elevation, colored by winning class
+        (with a legend) or by the rgb layer.
+
+        Matplotlib draws every point on the CPU, so above max_points
+        cells a random (seeded, reproducible) subset is drawn; the
+        legend counts still refer to ALL observed cells. Use
+        plot_semantic_3d_plotly() to explore the full map.
 
         Parameters
         ----------
@@ -348,6 +358,26 @@ class GridMapVisualizer:
         point_size : float
             Marker size passed to scatter().
 
+        color_by : {"class", "rgb"}
+            "class" (default): winning class color, with a legend.
+            "rgb": mean palette color of the cell, no legend.
+
+        class_colors : dict, optional
+            Per-class color overrides, {class_name: (r, g, b)} in
+            [0, 255] (color_by="class" only).
+
+        show_counts : bool
+            Append the number of cells to each legend entry.
+
+        equal_aspect : bool
+            Same scale on x, y, z, so z isn't visually stretched.
+
+        max_points : int or None
+            Maximum number of cells drawn (None = all).
+
+        seed : int
+            Seed of the subsampling.
+
         Returns
         -------
         (fig, ax)
@@ -355,37 +385,79 @@ class GridMapVisualizer:
 
         self.require_initialized()
 
-        count = self.grid_map.get_count_layer()
-        observed = count > 0
+        elevation = self.grid_map.get_elevation_layer()
+        valid = (self.grid_map.get_count_layer() > 0) & np.isfinite(elevation)
 
-        if not np.any(observed):
+        if not np.any(valid):
             raise RuntimeError(
                 "GridMap has no observed cells yet -- nothing to plot."
             )
 
-        elevation = self.grid_map.get_elevation_layer()
-        rgb = self.grid_map.get_rgb_layer()
+        rows, cols = np.nonzero(valid)
 
-        rows, cols = np.nonzero(observed)
+        labels = None
 
-        xs, ys = self.grid_map.cell_to_world(rows, cols)
-        zs = elevation[rows, cols]
+        if color_by == "class":
+            palette = self.get_class_palette(class_colors)
+            labels = self.get_winning_classes(valid)[0]
+            colors = palette[labels] / 255.0
+        elif color_by == "rgb":
+            rgb = self.grid_map.get_rgb_layer()[rows, cols]
+            colors = np.clip(np.nan_to_num(rgb, nan=0.0), 0, 255) / 255.0
+        else:
+            raise ValueError(
+                f"color_by must be 'class' or 'rgb', got {color_by!r}."
+            )
 
-        colors = np.clip(rgb[rows, cols], 0, 255).astype(np.float32)
-        colors = colors / 255.0
+        n_cells = rows.size
+        drawn = np.arange(n_cells)
+
+        if max_points is not None and n_cells > max_points:
+            rng = np.random.default_rng(seed)
+            drawn = np.sort(rng.choice(n_cells, max_points, replace=False))
+
+        xs, ys = self.grid_map.cell_to_world(rows[drawn], cols[drawn])
+        xs = np.asarray(xs)
+        ys = np.asarray(ys)
+        zs = elevation[rows[drawn], cols[drawn]]
 
         if ax is None:
-            fig = plt.figure(figsize=(7, 6))
+            fig = plt.figure(figsize=(10, 7))
             ax = fig.add_subplot(111, projection="3d")
         else:
             fig = ax.figure
 
-        ax.scatter(xs, ys, zs, c=colors, s=point_size)
+        ax.scatter(
+            xs, ys, zs,
+            c=colors[drawn],
+            s=point_size,
+            depthshade=False,
+            linewidths=0
+        )
 
-        ax.set_title("Semantic Point Cloud")
+        title = "Semantic Point Cloud"
+
+        if drawn.size < n_cells:
+            title += f" ({drawn.size} of {n_cells} cells shown)"
+
+        ax.set_title(title)
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
         ax.set_zlabel("z [m]")
+
+        if equal_aspect:
+            ax.set_box_aspect((
+                max(np.ptp(xs), 1e-3),
+                max(np.ptp(ys), 1e-3),
+                max(np.ptp(zs), 1e-3)
+            ))
+
+            # z is short at true scale: few ticks, or labels overlap.
+            from matplotlib.ticker import MaxNLocator
+            ax.zaxis.set_major_locator(MaxNLocator(3))
+
+        if labels is not None:
+            self.add_class_legend(ax, labels, palette, show_counts)
 
         return fig, ax
 
@@ -481,6 +553,102 @@ class GridMapVisualizer:
         fig.colorbar(im, ax=ax, fraction=0.046, label="cost")
 
         return fig, ax
+
+    def get_class_palette(self, class_colors=None):
+        """
+        One RGB color per class, (C, 3) float array in [0, 255], in
+        the GridMap's channel order: the segmentation palette from
+        ClassReducer.get_filtered_class_colors(), with optional
+        {class_name: (r, g, b)} overrides.
+        """
+
+        class_names = self.grid_map.class_names
+
+        palette = np.asarray(
+            self.grid_map.class_reducer.get_filtered_class_colors(),
+            dtype=np.float32
+        ).copy()
+
+        if palette.shape != (len(class_names), 3):
+            raise RuntimeError(
+                "ClassReducer palette has shape "
+                f"{palette.shape}, expected ({len(class_names)}, 3) "
+                "-- palette and GridMap channel order are out of sync."
+            )
+
+        if class_colors:
+            unknown = [n for n in class_colors if n not in class_names]
+
+            if unknown:
+                print(
+                    "[GridMapVisualizer] WARNING: class_colors has "
+                    f"names not in the GridMap: {unknown} "
+                    f"(available: {class_names})."
+                )
+
+            for k, name in enumerate(class_names):
+                if name in class_colors:
+                    palette[k] = [float(v) for v in class_colors[name]]
+
+        return palette
+
+    def get_winning_classes(self, mask, row_slice=None, col_slice=None):
+        """
+        Winning class (argmax of the fused probabilities) and its
+        probability for the cells selected by a boolean mask.
+
+        Parameters
+        ----------
+        mask : numpy.ndarray of bool
+            Over the full grid, or over the [row_slice, col_slice]
+            crop if the slices are given.
+
+        Returns
+        -------
+        labels : (N,) int, confidence : (N,) float, in np.nonzero(mask)
+        order.
+        """
+
+        probs = self.grid_map.get_semantic_probs_layer()
+
+        if row_slice is not None or col_slice is not None:
+            probs = probs[row_slice, col_slice]
+
+        cell_probs = np.nan_to_num(probs[mask], nan=0.0)
+        labels = np.argmax(cell_probs, axis=1)
+        confidence = cell_probs[np.arange(labels.size), labels]
+
+        return labels, confidence
+
+    def add_class_legend(self, ax, labels, palette, show_counts=True):
+        """
+        Legend with one entry per class present in labels, colored
+        like the plot, in class order, placed outside the axis on the
+        right (kept by savefig(bbox_inches="tight")).
+        """
+
+        from matplotlib.patches import Patch
+
+        counts = np.bincount(labels, minlength=len(self.grid_map.class_names))
+
+        handles = [
+            Patch(
+                facecolor=palette[k] / 255.0,
+                edgecolor="none",
+                label=f"{name} ({int(counts[k])})" if show_counts else name
+            )
+            for k, name in enumerate(self.grid_map.class_names)
+            if counts[k] > 0
+        ]
+
+        ax.legend(
+            handles=handles,
+            title="Classes",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            frameon=False
+        )
 
     def require_initialized(self):
         if not self.grid_map.is_initialized():
