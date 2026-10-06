@@ -15,21 +15,44 @@ streams, so the closest pose in time is used, and the resulting time
 gap is reported explicitly (via a warning past a configurable
 tolerance) rather than hidden.
 
+POSE FRAME: each row of the odometry log stores the robot body's
+pose in TWO world frames:
+
+    - "odom"   : kinematic odometry (legs + IMU) only.
+    - "vision" : kinematic + visual odometry; usually drifts less.
+
+The two frames have different origins and orientations, so poses
+from different frames must never be mixed. The pose_frame argument
+selects which one is read for the whole sequence.
+
 CAMERA POSE vs BODY POSE: the odometry log only records the robot
-BODY's pose (odom_tform_body), not the camera's own pose. By
+BODY's pose (<pose_frame>_tform_body), not the camera's own pose. By
 default, pair() returns that body pose directly, used as an
 approximation of the camera pose (the placeholder used everywhere in
 this project so far). If a CameraCalibrationConfig + camera_name are
 provided (the static body -> camera offset produced on the robot,
 see fusion/camera_calibration_loader.py), pair() instead composes it
 with each frame's body pose to return the TRUE camera pose in the
-odom frame:
+selected world frame:
 
-    R_odom_camera = R_odom_body @ R_body_camera
-    t_odom_camera = R_odom_body @ t_body_camera + t_odom_body
+    R_world_camera = R_world_body @ R_body_camera
+    t_world_camera = R_world_body @ t_body_camera + t_world_body
 
 Nothing downstream (GridMap, GeometricCost, ...) needs to change
 either way -- they just consume whichever R, t this returns.
+
+MULTI-CAMERA FOLDERS: spot_rgb_depth_log.py writes every camera of a
+shot into the SAME folders with the SAME timestamp:
+
+    <ts>_frontleft_fisheye_image.jpg   <ts>_frontleft_depth_in_visual_frame.png
+    <ts>_right_fisheye_image.jpg       <ts>_right_depth_in_visual_frame.png
+    ...
+
+so a timestamp alone does NOT identify a file. When camera_name is
+given, only that camera's files are globbed (by their Spot source
+name), and two files mapping to the same timestamp raise instead of
+silently overwriting each other -- which is what previously let
+frontleft frames be processed with the right camera's calibration.
 
 This script is intended for offline field-data testing only. It is
 not part of the live Spot pipeline.
@@ -52,6 +75,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from fusion.geometry_utils import quaternion_to_rotation_matrix, compose_poses
 
 
+SUPPORTED_POSE_FRAMES = ("odom", "vision")
+
+# Filename suffixes written by spot_rgb_depth_log.py (Spot source
+# names). The leading underscore matters: "*_left_..." must not match
+# "<ts>_frontleft_...".
+RGB_SUFFIX = "_fisheye_image.jpg"
+DEPTH_SUFFIX = "_depth_in_visual_frame.png"
+
+
 class FramePosePairer:
     """Pairs RGB/depth frame files with the closest logged pose."""
 
@@ -62,7 +94,8 @@ class FramePosePairer:
         pose_csv_path,
         max_pose_dt=1.0,
         camera_calibration=None,
-        camera_name=None
+        camera_name=None,
+        pose_frame="odom"
     ):
         """
         Parameters
@@ -75,8 +108,12 @@ class FramePosePairer:
 
         pose_csv_path : str or Path
             Path to the odometry log CSV. Expected columns:
-            timestamp, ref_frame, pos_x, pos_y, pos_z, rot_x, rot_y,
-            rot_z, rot_w (quaternion, scalar-last / ROS convention).
+            timestamp, then for each of the "odom" and "vision"
+            frames: <frame>_x, <frame>_y, <frame>_z, <frame>_qx,
+            <frame>_qy, <frame>_qz, <frame>_qw (quaternion,
+            scalar-last / ROS convention). Extra columns (e.g.
+            acq_time_robot) are ignored. Only the columns of the
+            frame selected by pose_frame are required.
 
         max_pose_dt : float
             Time gap, in seconds, past which a frame<->pose match
@@ -98,6 +135,12 @@ class FramePosePairer:
             frames; for several cameras, build one instance per
             camera (same camera_calibration, different
             rgb_dir/depth_dir/camera_name).
+
+        pose_frame : {"odom", "vision"}
+            Which world frame to read the body pose in. "vision"
+            (kinematic + visual odometry) usually drifts less than
+            "odom" (kinematic only). Never mix the two within one
+            sequence.
         """
 
         self.rgb_dir = Path(rgb_dir)
@@ -105,6 +148,14 @@ class FramePosePairer:
         self.pose_csv_path = Path(pose_csv_path)
         self.max_pose_dt = max_pose_dt
         self.camera_name = camera_name
+
+        if pose_frame not in SUPPORTED_POSE_FRAMES:
+            raise ValueError(
+                f"pose_frame must be one of {SUPPORTED_POSE_FRAMES}, "
+                f"got {pose_frame!r}."
+            )
+
+        self.pose_frame = pose_frame
 
         if (camera_calibration is None) != (camera_name is None):
             raise ValueError(
@@ -142,12 +193,18 @@ class FramePosePairer:
         self.poses = []
 
     def load_poses(self):
-        """Load and parse every row of the odometry log CSV."""
+        """
+        Load and parse every row of the odometry log CSV, reading
+        the body pose in the frame selected by self.pose_frame.
+        """
+
+        p = self.pose_frame
+
+        position_fields = [f"{p}_x", f"{p}_y", f"{p}_z"]
+        quaternion_fields = [f"{p}_qx", f"{p}_qy", f"{p}_qz", f"{p}_qw"]
 
         required_fields = {
-            "timestamp", "ref_frame",
-            "pos_x", "pos_y", "pos_z",
-            "rot_x", "rot_y", "rot_z", "rot_w"
+            "timestamp", *position_fields, *quaternion_fields
         }
 
         with open(
@@ -159,9 +216,12 @@ class FramePosePairer:
                 reader.fieldnames is None
                 or not required_fields.issubset(reader.fieldnames)
             ):
+                missing = required_fields - set(reader.fieldnames or [])
+
                 raise ValueError(
                     f"Pose log {self.pose_csv_path} is missing "
-                    f"required columns. Found: {reader.fieldnames}"
+                    f"required columns for pose_frame='{p}': "
+                    f"{sorted(missing)}. Found: {reader.fieldnames}"
                 )
 
             poses = []
@@ -176,19 +236,12 @@ class FramePosePairer:
                     )
 
                 t = np.array(
-                    [
-                        float(row["pos_x"]),
-                        float(row["pos_y"]),
-                        float(row["pos_z"])
-                    ],
+                    [float(row[field]) for field in position_fields],
                     dtype=np.float32
                 )
 
                 R = quaternion_to_rotation_matrix(
-                    float(row["rot_x"]),
-                    float(row["rot_y"]),
-                    float(row["rot_z"]),
-                    float(row["rot_w"])
+                    *(float(row[field]) for field in quaternion_fields)
                 )
 
                 poses.append((timestamp, R, t))
@@ -213,13 +266,30 @@ class FramePosePairer:
         directory are skipped, with a warning.
         """
 
-        rgb_by_timestamp = self.index_by_timestamp(
-            sorted(self.rgb_dir.glob("*.jpg"))
-        )
+        if self.camera_name is None:
+            # Legacy single-camera folders: every file belongs to the
+            # same (unnamed) camera.
+            rgb_pattern, depth_pattern = "*.jpg", "*.png"
+        else:
+            rgb_pattern = f"*_{self.camera_name}{RGB_SUFFIX}"
+            depth_pattern = f"*_{self.camera_name}{DEPTH_SUFFIX}"
 
-        depth_by_timestamp = self.index_by_timestamp(
-            sorted(self.depth_dir.glob("*.png"))
-        )
+        rgb_files = sorted(self.rgb_dir.glob(rgb_pattern))
+        depth_files = sorted(self.depth_dir.glob(depth_pattern))
+
+        if self.camera_name is not None and not rgb_files:
+            others = sorted({
+                p.name.split("_", 3)[-1]
+                for p in self.rgb_dir.glob("*.jpg")
+            })
+            raise ValueError(
+                f"No RGB files for camera '{self.camera_name}' "
+                f"(pattern {rgb_pattern}) in {self.rgb_dir}. "
+                f"Sources found there: {others}"
+            )
+
+        rgb_by_timestamp = self.index_by_timestamp(rgb_files)
+        depth_by_timestamp = self.index_by_timestamp(depth_files)
 
         common = sorted(
             set(rgb_by_timestamp) & set(depth_by_timestamp)
@@ -268,7 +338,17 @@ class FramePosePairer:
             # Rounded to microsecond precision so two independently
             # parsed floats for the exact same timestamp string
             # always land on the same dict key.
-            index[round(timestamp, 6)] = path
+            key = round(timestamp, 6)
+
+            if key in index:
+                raise ValueError(
+                    f"Two files share timestamp {path.name[:22]}: "
+                    f"{index[key].name} and {path.name}. The folder "
+                    "holds several cameras -- pass camera_name so "
+                    "only one camera's files are selected."
+                )
+
+            index[key] = path
 
         return index
 
@@ -345,8 +425,8 @@ class FramePosePairer:
                 # camera's pose.
                 R, t = R_body, t_body
             else:
-                # True camera pose: odom_tform_body composed with
-                # the static body_tform_camera.
+                # True camera pose: <pose_frame>_tform_body composed
+                # with the static body_tform_camera.
                 R, t = compose_poses(
                     R_body, t_body,
                     self.R_body_camera, self.t_body_camera
@@ -371,7 +451,8 @@ class FramePosePairer:
 
         print(
             f"[FramePosePairer] Paired {len(results)} frame(s) with "
-            f"poses ({pose_kind}, max time gap: {max_dt:.3f}s)."
+            f"poses ({pose_kind}, frame: {self.pose_frame}, "
+            f"max time gap: {max_dt:.3f}s)."
         )
 
         return results
@@ -416,7 +497,8 @@ if __name__ == "__main__":
         pose_csv_path=PROJECT_ROOT / "testset" / "pose" / "odometry_log.csv",
         max_pose_dt=1.0,
         camera_calibration=camera_calibration,
-        camera_name="right"
+        camera_name="frontleft",
+        pose_frame="odom"
     )
 
     paired_frames = pairer.pair()

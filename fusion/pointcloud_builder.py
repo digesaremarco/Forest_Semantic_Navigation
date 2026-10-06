@@ -68,6 +68,17 @@ by depth_scale, which was fine with a placeholder value shaped like
 a meters-per-unit factor (e.g. 0.001) but silently produces
 nonsense (depth inflated ~1000x) with the real value -- fixed to
 divide.
+
+IMAGE ORIENTATION: build() takes RGB and depth in the camera's NATIVE
+raster -- exactly as Spot returns them (and as spot_rgb_depth_log.py
+saves them with AUTO_ROTATE = False) -- because the calibration (K,
+extrinsics) refers to that raster. Native is NOT upright on every
+camera (right: rolled 180 deg; frontleft/frontright: rolled ~90 deg),
+while SegFormer was trained on upright images. So only for inference
+the RGB is turned upright by UPRIGHT_ROT90_K[camera] quarter turns
+(np.rot90 convention), and the probability maps are turned back by
+the same amount before being associated with the native depth. Depth
+and backprojection never leave the native raster.
 """
 
 import cv2
@@ -75,6 +86,20 @@ import numpy as np
 
 from perception.segformer_inference import SegFormerInference
 from perception.class_reducer import ClassReducer
+
+
+# Quarter turns (np.rot90, positive = counterclockwise) that bring each
+# camera's NATIVE raster upright, for SegFormer only. From the
+# extrinsics and spot_rgb_depth_log.py's ROTATION_ANGLE (right 180,
+# frontleft -78, frontright -102, left/back 0), rounded to 90 deg: the
+# front cameras keep a residual ~12 deg roll, harmless for the network.
+UPRIGHT_ROT90_K = {
+    "frontleft": 3,
+    "frontright": 3,
+    "left": 0,
+    "right": 2,
+    "back": 0,
+}
 
 
 class PointCloudBuilder:
@@ -126,7 +151,7 @@ class PointCloudBuilder:
             float(depth_scale)
         )
 
-    def build(self, rgb_image, depth_image, camera_name):
+    def build(self, rgb_image, depth_image, camera_name, upright_rot90_k=None):
         """
         Build a semantic point cloud from an RGB image and
         its corresponding depth image.
@@ -143,6 +168,13 @@ class PointCloudBuilder:
             Which camera this (rgb_image, depth_image) pair came
             from (e.g. "right"), used to look up that camera's
             intrinsics/depth_scale in camera_calibration.
+
+        upright_rot90_k : int, optional
+            Quarter turns (np.rot90 convention) that make the NATIVE
+            rgb_image upright for SegFormer. None (default) uses
+            UPRIGHT_ROT90_K[camera_name]; pass 0 to run the network
+            on the native raster. Both inputs must be NATIVE, see the
+            module docstring.
 
         Returns
         -------
@@ -162,13 +194,51 @@ class PointCloudBuilder:
         self.validate_rgb_image(rgb_image)
         self.validate_depth_image(depth_image)
 
+        if upright_rot90_k is None:
+            if camera_name not in UPRIGHT_ROT90_K:
+                raise ValueError(
+                    f"No upright orientation known for camera "
+                    f"'{camera_name}'. Add it to UPRIGHT_ROT90_K or pass "
+                    "upright_rot90_k explicitly."
+                )
+            upright_rot90_k = UPRIGHT_ROT90_K[camera_name]
+
+        upright_rot90_k = int(upright_rot90_k) % 4
+
+        if rgb_image.shape[:2] != depth_image.shape[:2]:
+            raise ValueError(
+                f"RGB {rgb_image.shape[:2]} and depth "
+                f"{depth_image.shape[:2]} must have the same (H, W): "
+                "they are associated pixel by pixel."
+            )
+
         fx, fy, cx, cy, depth_scale = self.get_camera_params(camera_name)
+
+        intrinsics = self.camera_calibration.get_intrinsics(camera_name)
+        native_shape = (int(intrinsics["height"]), int(intrinsics["width"]))
+
+        if tuple(depth_image.shape[:2]) != native_shape:
+            raise ValueError(
+                f"Camera '{camera_name}': depth is "
+                f"{depth_image.shape[:2]}, but the calibration expects "
+                f"the native raster {native_shape} (HxW). Images must "
+                "be passed NATIVE (not rotated for display), and depth "
+                "must be depth_in_visual_frame."
+            )
 
         depth_height, depth_width = depth_image.shape[:2]
 
         # SegFormer inference
+        #
+        # Upright only for the network; everything else stays native.
+        rgb_for_network = (
+            np.ascontiguousarray(np.rot90(rgb_image, upright_rot90_k))
+            if upright_rot90_k
+            else rgb_image
+        )
+
         probabilities = self.segformer.infer(
-            rgb_image
+            rgb_for_network
         )
 
         # probabilities:
@@ -184,15 +254,28 @@ class PointCloudBuilder:
         # filtered_probabilities:
         # (16, H_seg, W_seg)
 
-        # Resize semantic probabilities to depth resolution
+        # Resize to the depth resolution IN THE UPRIGHT RASTER (H and
+        # W swap for a quarter turn), then turn back to native so the
+        # probabilities are pixel-aligned with the native depth.
+        upright_h, upright_w = (
+            (depth_height, depth_width)
+            if upright_rot90_k % 2 == 0
+            else (depth_width, depth_height)
+        )
+
         if (
-            filtered_probabilities.shape[1] != depth_height
-            or filtered_probabilities.shape[2] != depth_width
+            filtered_probabilities.shape[1] != upright_h
+            or filtered_probabilities.shape[2] != upright_w
         ):
             filtered_probabilities = self.resize_probabilities(
                 filtered_probabilities,
-                depth_width,
-                depth_height
+                upright_w,
+                upright_h
+            )
+
+        if upright_rot90_k:
+            filtered_probabilities = np.ascontiguousarray(
+                np.rot90(filtered_probabilities, -upright_rot90_k, axes=(1, 2))
             )
 
         # Convert depth to meters.
@@ -417,31 +500,26 @@ class PointCloudBuilder:
             )
 
 
-import sys
-from pathlib import Path
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from PIL import Image
-
 # ---------------------------------------------------------------------
-# Project paths
-# ---------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-sys.path.append(str(PROJECT_ROOT))
-
-from perception.perception_config_loader import PerceptionConfig
-from fusion.camera_calibration_loader import CameraCalibrationConfig
-
-
-# ---------------------------------------------------------------------
-# Main
+# Main (demo). Imports live inside the guard so that importing
+# PointCloudBuilder from the pipeline does not pull in matplotlib or
+# touch sys.path.
 # ---------------------------------------------------------------------
 
 if __name__ == "__main__":
+
+    import sys
+    from pathlib import Path
+
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+    sys.path.append(str(PROJECT_ROOT))
+
+    from perception.perception_config_loader import PerceptionConfig
+    from fusion.camera_calibration_loader import CameraCalibrationConfig
 
     # -------------------------------------------------------------
     # Configuration
@@ -457,14 +535,20 @@ if __name__ == "__main__":
 
     # Which camera this test frame came from -- change this if you
     # are testing a different camera's pair of images.
-    camera_name = "right"
+    camera_name = "frontleft"
 
-    rgb_path = (
-        PROJECT_ROOT / "testset" / "paired_images" / "000000.jpg"
-    )
+    # Files exactly as saved by spot_rgb_depth_log.py (NATIVE raster).
+    rgb_path = sorted(
+        (PROJECT_ROOT / "testset" / "images").glob(
+            f"*_{camera_name}_fisheye_image.jpg"
+        )
+    )[0]
 
     depth_path = (
-        PROJECT_ROOT / "testset" / "paired_depths" / "000000.png"
+        PROJECT_ROOT / "testset" / "depths"
+        / rgb_path.name.replace(
+            "_fisheye_image.jpg", "_depth_in_visual_frame.png"
+        )
     )
 
     # -------------------------------------------------------------
@@ -499,9 +583,6 @@ if __name__ == "__main__":
     depth_image = np.array(
         Image.open(depth_path)
     )
-
-    #rgb_image = np.rot90(rgb_image, k=-1)
-    #depth_image = np.rot90(depth_image, k=-1)
 
     print("RGB shape:   ", rgb_image.shape)
     print("Depth shape: ", depth_image.shape)
@@ -574,6 +655,11 @@ if __name__ == "__main__":
     #
     # -------------------------------------------------------------
 
+    # Inputs are native, so the mask is rebuilt on the input depth,
+    # with exactly the same validity test as build() (including the
+    # 4 m cutoff -- without it the number of pixels would not match
+    # the number of points). Both panels are then shown upright.
+
     height, width = depth_image.shape[:2]
 
     semantic_image = np.zeros(
@@ -581,21 +667,27 @@ if __name__ == "__main__":
         dtype=np.uint8
     )
 
-    # -------------------------------------------------------------
-    # Project valid semantic colors back into image coordinates
-    # -------------------------------------------------------------
-
-    # Reconstruct the valid-depth mask
-    valid_depth = (
-        np.isfinite(depth_image)
-        & (depth_image > 0)
+    depth_meters = (
+        depth_image.astype(np.float32)
+        / camera_calibration.get_depth_scale(camera_name)
     )
 
-    valid_v, valid_u = np.where(valid_depth)
+    valid_depth = (
+        np.isfinite(depth_meters)
+        & (depth_meters > 0)
+        & (depth_meters < 4.0)
+    )
 
-    # If the point cloud was generated from exactly the same
-    # depth pixels, their order corresponds to these coordinates.
+    valid_v, valid_u = np.nonzero(valid_depth)
+
+    # Same np.nonzero order as in build(), so row i of the point
+    # cloud is pixel (valid_v[i], valid_u[i]).
     semantic_image[valid_v, valid_u] = semantic_colors
+
+    k_up = UPRIGHT_ROT90_K.get(camera_name, 0)
+    semantic_image = np.rot90(semantic_image, k_up)
+    rgb_image = np.rot90(rgb_image, k_up)
+
 
     # -------------------------------------------------------------
     # Visualize RGB + segmentation + point cloud

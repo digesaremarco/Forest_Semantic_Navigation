@@ -93,6 +93,20 @@ Design choices (see conversation history for the reasoning):
   (weighted empirical variance of heights inside a cell) measures
   real height spread (grass, rocks), not estimation uncertainty.
 
+- VERTICAL DATUM: points are fused in the odom frame, whose z = 0
+  is roughly the body height at boot, not the ground. With
+  height_datum.mode = ground_first_frame, the ground plane is fitted
+  (RANSAC, near-horizontal candidates only) on the first frame with
+  enough ground points, evaluated below the camera, and stored as
+  self.height_datum. get_elevation_layer() returns heights relative
+  to it, so the ground under the starting pose is 0. Fixed once per
+  session (re-estimating it per frame would make old and new cells
+  inconsistent). The accumulators stay in raw odom heights: the datum
+  is applied only in the getter, saved with the map and replaceable
+  later (e.g. by Spot's own ground plane estimate) without re-fusing.
+  Roughness and variance are height DIFFERENCES and do not depend on
+  it.
+
 - Cells never observed are NaN in every layer, not zero: zero is a
   valid observed value (e.g. z=0, or a class probability of 0), so
   it cannot double as "unobserved". Downstream code (visualization,
@@ -153,6 +167,18 @@ class GridMap:
         self.rgb_wsum = None
         self.semantic_alpha = None
         self.count = None
+
+        # Vertical datum (see module docstring). None until estimated
+        # (or forever, with mode "none" -- then 0 is applied).
+        self.height_datum_mode = getattr(
+            self.grid_map_config, "height_datum_mode", "none"
+        )
+        self.height_datum = None
+        self._datum_warned = False
+
+        # Dedicated, seeded generator: the same first frame always
+        # gives the same datum (e.g. both maps of the A/B test).
+        self._datum_rng = np.random.default_rng(0)
 
     def is_initialized(self):
         """Whether the grid has been anchored by a first update()."""
@@ -277,6 +303,12 @@ class GridMap:
 
         points_world = self.transform_to_world(points_xyz, R, t)
 
+        if (
+            self.height_datum_mode == "ground_first_frame"
+            and self.height_datum is None
+        ):
+            self.try_estimate_height_datum(points_world, t)
+
         row_idx, col_idx, in_bounds = self.compute_cell_indices(
             points_world
         )
@@ -337,6 +369,149 @@ class GridMap:
 
         np.add.at(self.count.reshape(-1), flat_idx, 1.0)
 
+    def try_estimate_height_datum(self, points_world, t):
+        """
+        Fit the ground plane on one frame and set self.height_datum to
+        its height directly below the camera position t. Leaves the
+        datum unset (to retry on the next frame) if the frame has too
+        few points in range or no near-horizontal plane with enough
+        inliers.
+
+        Returns
+        -------
+        bool : whether the datum was set.
+        """
+
+        cfg = self.grid_map_config
+
+        horizontal = np.linalg.norm(points_world[:, :2] - t[:2], axis=1)
+        in_range = (
+            (horizontal >= cfg.height_datum_min_range)
+            & (horizontal <= cfg.height_datum_max_range)
+        )
+
+        candidates = points_world[in_range].astype(np.float64)
+
+        if candidates.shape[0] < cfg.height_datum_min_inliers:
+            print(
+                f"[GridMap] Height datum: only {candidates.shape[0]} "
+                f"point(s) within {cfg.height_datum_min_range}-"
+                f"{cfg.height_datum_max_range} m, retrying on the next "
+                "frame."
+            )
+            return False
+
+        fit = self.fit_ground_plane(candidates)
+
+        if fit is None:
+            print(
+                "[GridMap] Height datum: no near-horizontal plane with "
+                f">= {cfg.height_datum_min_inliers} inliers, retrying "
+                "on the next frame."
+            )
+            return False
+
+        normal, d, n_inliers, tilt = fit
+
+        # Plane height at the camera's (x, y): n . p + d = 0.
+        datum = -(d + normal[0] * t[0] + normal[1] * t[1]) / normal[2]
+
+        self.height_datum = float(datum)
+
+        print(
+            f"[GridMap] Height datum set: ground {self.height_datum:+.3f} m "
+            f"(odom z), camera {float(t[2]) - self.height_datum:.2f} m "
+            f"above it; plane tilt {tilt:.1f} deg, {n_inliers} inliers "
+            f"out of {candidates.shape[0]} points."
+        )
+
+        return True
+
+    def fit_ground_plane(self, points, max_points=20000):
+        """
+        RANSAC plane fit restricted to near-horizontal candidates
+        (tilt <= height_datum.max_tilt_deg), refined by least squares
+        on the inliers.
+
+        Returns
+        -------
+        (normal, d, n_inliers, tilt_deg) with normal . p + d = 0,
+        |normal| = 1, normal pointing up; or None.
+        """
+
+        cfg = self.grid_map_config
+        rng = self._datum_rng
+
+        if points.shape[0] > max_points:
+            points = points[
+                rng.choice(points.shape[0], max_points, replace=False)
+            ]
+
+        cos_max_tilt = np.cos(np.radians(cfg.height_datum_max_tilt_deg))
+        threshold = cfg.height_datum_ransac_threshold
+
+        best_inliers = None
+        best_count = 0
+
+        for _ in range(cfg.height_datum_ransac_iterations):
+            sample = points[rng.choice(points.shape[0], 3, replace=False)]
+            normal = np.cross(sample[1] - sample[0], sample[2] - sample[0])
+            norm = np.linalg.norm(normal)
+
+            if norm < 1e-9:
+                continue
+
+            normal /= norm
+
+            # Steep candidates (trunks, rocks) are not the ground.
+            if abs(normal[2]) < cos_max_tilt:
+                continue
+
+            d = -normal @ sample[0]
+            inliers = np.abs(points @ normal + d) < threshold
+            count = int(np.count_nonzero(inliers))
+
+            if count > best_count:
+                best_count, best_inliers = count, inliers
+
+        if best_inliers is None or best_count < cfg.height_datum_min_inliers:
+            return None
+
+        inlier_points = points[best_inliers]
+        centroid = inlier_points.mean(axis=0)
+
+        # full_matrices=False: otherwise U is N x N (GBs for 20k points).
+        _, _, vt = np.linalg.svd(inlier_points - centroid, full_matrices=False)
+        normal = vt[-1]
+
+        if normal[2] < 0:
+            normal = -normal
+
+        d = -normal @ centroid
+        tilt = float(np.degrees(np.arccos(np.clip(normal[2], -1.0, 1.0))))
+
+        # The refinement can drift past the limit on a borderline fit.
+        if tilt > cfg.height_datum_max_tilt_deg:
+            return None
+
+        return normal, float(d), best_count, tilt
+
+    def get_height_datum(self):
+        """
+        Odom-frame height [m] subtracted from the elevation layer, or
+        None if not estimated (yet). See module docstring.
+        """
+
+        return self.height_datum
+
+    def set_height_datum(self, datum):
+        """
+        Override the vertical datum (e.g. with Spot's ground plane
+        estimate). None reverts to raw odom heights.
+        """
+
+        self.height_datum = None if datum is None else float(datum)
+
     def transform_to_world(self, points_xyz, R, t):
         """Transform points from the camera frame to the world frame."""
 
@@ -375,7 +550,9 @@ class GridMap:
 
     def get_elevation_layer(self):
         """
-        Return the elevation layer (inverse-variance weighted mean).
+        Return the elevation layer (inverse-variance weighted mean),
+        relative to the height datum when one is set (ground under
+        the starting pose = 0), raw odom heights otherwise.
 
         Returns
         -------
@@ -384,7 +561,22 @@ class GridMap:
             observed.
         """
 
-        return self.safe_divide(self.elevation_wsum, self.weight_sum)
+        elevation = self.safe_divide(self.elevation_wsum, self.weight_sum)
+
+        if self.height_datum is not None:
+            return elevation - np.float32(self.height_datum)
+
+        if (
+            self.height_datum_mode == "ground_first_frame"
+            and not self._datum_warned
+        ):
+            print(
+                "[GridMap] WARNING: height datum not estimated yet; "
+                "elevation is in raw odom heights."
+            )
+            self._datum_warned = True
+
+        return elevation
 
     def get_elevation_variance_layer(self):
         """
@@ -627,7 +819,10 @@ class GridMap:
             cell_n=np.array(self.cell_n),
             resolution=np.array(self.resolution),
             class_names=np.array(self.class_names),
-            noise_params=np.array(self.noise_params())
+            noise_params=np.array(self.noise_params()),
+            height_datum=np.array(
+                np.nan if self.height_datum is None else self.height_datum
+            )
         )
 
         print(f"[GridMap] Saved grid state to {path}.")
@@ -745,6 +940,15 @@ class GridMap:
                         "fusion will mix inconsistent weights."
                     )
 
+        if "height_datum" in files:
+            saved_datum = float(data["height_datum"])
+            self.height_datum = (
+                None if np.isnan(saved_datum) else saved_datum
+            )
+        else:
+            # Older files: no datum stored, keep raw odom heights.
+            self.height_datum = None
+
         print(f"[GridMap] Loaded grid state from {path}.")
 
     def reset(self):
@@ -757,6 +961,8 @@ class GridMap:
         self.rgb_wsum = None
         self.semantic_alpha = None
         self.count = None
+        self.height_datum = None
+        self._datum_warned = False
 
     def noise_params(self):
         """Noise model parameters, in a fixed order (for save/load)."""
