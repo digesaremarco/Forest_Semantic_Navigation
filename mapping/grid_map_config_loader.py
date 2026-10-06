@@ -17,6 +17,8 @@ class GridMapConfig:
         "reference_distance": 1.0,
     }
 
+    HEIGHT_DATUM_MODES = ("none", "ground_first_frame")
+
     def __init__(self, config_path):
         self.config_path = Path(config_path)
 
@@ -36,6 +38,7 @@ class GridMapConfig:
         self.load_map_config()
         self.load_bounds_config()
         self.load_noise_config()
+        self.load_height_datum_config()
 
     def load_map_config(self):
         map_config = self._config.get("map")
@@ -123,6 +126,79 @@ class GridMapConfig:
         self.noise_alpha = values["alpha"]
         self.noise_exponent = values["exponent"]
         self.noise_reference_distance = values["reference_distance"]
+
+    def load_height_datum_config(self):
+        """
+        Load the vertical datum settings (see grid_map_config.yaml).
+
+        Exposed as height_datum_mode ("none" | "ground_first_frame")
+        and height_datum_<param> attributes, the names GridMap reads.
+
+        The section is optional for backward compatibility: if it is
+        missing, mode "none" (raw odom heights) is used and a warning
+        is printed. If present with mode ground_first_frame, every
+        parameter is required.
+        """
+
+        section = self._config.get("height_datum")
+
+        if section is None:
+            print(
+                f"[GridMapConfig] WARNING: no 'height_datum' section in "
+                f"{self.config_path}; elevations stay in raw odom "
+                "heights (mode: none)."
+            )
+            section = {"mode": "none"}
+
+        mode = section.get("mode")
+
+        if mode not in self.HEIGHT_DATUM_MODES:
+            raise ValueError(
+                f"height_datum.mode must be one of "
+                f"{self.HEIGHT_DATUM_MODES}, got {mode!r}."
+            )
+
+        self.height_datum_mode = mode
+
+        if mode == "none":
+            return
+
+        float_keys = (
+            "min_range", "max_range", "ransac_threshold", "max_tilt_deg"
+        )
+        int_keys = ("ransac_iterations", "min_inliers")
+
+        for key in float_keys + int_keys:
+            if key not in section:
+                raise ValueError(
+                    f"Missing 'height_datum.{key}' in grid map "
+                    "configuration."
+                )
+
+        for key in float_keys:
+            value = self.to_float(section[key], f"height_datum.{key}")
+            self.validate_positive(value, f"height_datum.{key}")
+            setattr(self, f"height_datum_{key}", value)
+
+        for key in int_keys:
+            value = section[key]
+
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"height_datum.{key} must be an integer, got {value!r}."
+                )
+
+            self.validate_positive(value, f"height_datum.{key}")
+            setattr(self, f"height_datum_{key}", value)
+
+        if self.height_datum_min_range >= self.height_datum_max_range:
+            raise ValueError(
+                "height_datum.min_range must be smaller than "
+                "height_datum.max_range."
+            )
+
+        if self.height_datum_max_tilt_deg >= 90:
+            raise ValueError("height_datum.max_tilt_deg must be < 90.")
 
     @staticmethod
     def compute_cell_n(map_length, resolution):
