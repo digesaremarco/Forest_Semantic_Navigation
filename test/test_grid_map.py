@@ -43,25 +43,19 @@ plain-mean behavior) is fused from the same point clouds, and the
 two maps are compared at the end. Small differences mean point
 density was already doing most of the near/far weighting.
 
-IMAGE ORIENTATION: the camera extrinsics for the "right" camera
-confirm it is physically mounted rolled ~180 deg (see
-fusion/diagnose_camera_orientation.py) -- a known Boston Dynamics
-mounting detail, not a bug. The extrinsics/intrinsics are calibrated
-against the sensor's NATIVE (rolled) raster.
+IMAGE ORIENTATION: the testset files are used exactly as
+spot_rgb_depth_log.py saves them (AUTO_ROTATE = False), i.e. in each
+camera's NATIVE raster -- the one the calibration refers to. Nothing
+is rotated here. PointCloudBuilder turns only the RGB upright for
+SegFormer (UPRIGHT_ROT90_K: right 180 deg, front cameras ~90 deg)
+and maps the probabilities back to native; depth and backprojection
+stay native. Do NOT feed files rotated for display: build() rejects
+them when the shape no longer matches, but a 180 deg rotation keeps
+the shape and would silently flip the geometry.
 
-For THIS testset, both the RGB and the depth files look upright to a
-human (the opposite of native/rolled), and PointCloudBuilder.build()
-associates each depth pixel with its semantic label using the SAME
-(row, col) index on both arrays (no rotation happens internally) --
-so RGB and depth must stay pixel-aligned with EACH OTHER, and that
-shared orientation must also match the native convention the
-extrinsics assume. load_frame() below rotates BOTH images 180
-degrees for that reason. (An earlier attempt rotated depth only,
-which fixed the raw elevation geometry but desynced RGB/depth pixel
-correspondence, silently reassigning semantic labels across the
-image -- the symptom was elevated points showing up mislabeled as
-"generic_ground".) If a future testset's files are already in native
-orientation, this correction must be removed.
+MULTI-CAMERA FOLDERS: testset/images and testset/depths may hold
+every camera of each shot (same timestamp, camera in the filename);
+FramePosePairer selects camera_name's files only.
 
 This script is intended for offline field-data testing only. It is
 not part of the live Spot pipeline.
@@ -103,24 +97,17 @@ USE_KEYFRAMES = True
 KEYFRAME_MIN_TRANSLATION = 0.10    # [m]
 KEYFRAME_MIN_ROTATION_DEG = 5.0    # [deg]
 
-
 def load_frame(rgb_path, depth_path):
     """
-    Undo the 180-degree rotation on BOTH RGB and depth for THIS
-    testset.
+    Load RGB and depth exactly as Spot saved them (NATIVE raster).
 
-    Both files currently look upright (display orientation), not
-    native. Rotating only one of the two (tried earlier) desyncs the
-    pixel-wise RGB/depth correspondence PointCloudBuilder relies on
-    for semantic labeling -- see the IMAGE ORIENTATION note at the
-    top of this file. np.rot90(img, k=2) reverses both rows and
-    columns, undoing a 180-degree rotation exactly.
+    No rotation here -- see the IMAGE ORIENTATION note at the top of
+    this file. Image size vs calibration and RGB/depth alignment are
+    checked inside PointCloudBuilder.build().
     """
 
     rgb = np.array(Image.open(rgb_path).convert("RGB"))
     depth = np.array(Image.open(depth_path))
-    rgb = np.rot90(rgb, k=2)
-    depth = np.rot90(depth, k=2)
 
     return rgb, depth
 
@@ -260,7 +247,7 @@ if __name__ == "__main__":
 
     # Which camera this dataset's testset/images + testset/depths
     # came from -- change this if you test a different camera.
-    camera_name = "right"
+    camera_name = "frontleft"
 
     # -------------------------------------------------------------
     # Pair real frames with real poses (true camera pose)
@@ -317,6 +304,18 @@ if __name__ == "__main__":
             grid_map_unweighted = GridMap(
                 make_unweighted_config(grid_map_config), class_reducer
             )
+
+            # If GridMap reads alpha from a nested 'noise' section
+            # instead of config.noise_alpha, the setattr above does
+            # nothing and the A/B would silently compare two
+            # identical maps.
+            if grid_map_unweighted.noise_alpha != 0:
+                raise RuntimeError(
+                    "make_unweighted_config() did not reach GridMap: "
+                    f"unweighted map still has noise_alpha = "
+                    f"{grid_map_unweighted.noise_alpha}. Check where "
+                    "GridMap reads noise_alpha from the config."
+                )
 
     if USE_KEYFRAMES:
         print(
@@ -446,6 +445,16 @@ if __name__ == "__main__":
 
     print("Grid shape:", elevation.shape)
     print("Origin:", grid_map.get_origin())
+
+    datum = grid_map.get_height_datum()
+
+    if datum is None:
+        print("Height datum: none (elevation in raw odom heights)")
+    else:
+        print(
+            f"Height datum: {datum:+.3f} m odom z -> elevation 0 = "
+            "ground under the starting pose"
+        )
     print(
         "Observed cells:",
         np.isfinite(elevation).sum(), "/", elevation.size

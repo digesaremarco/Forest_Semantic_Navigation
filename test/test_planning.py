@@ -19,13 +19,15 @@ FramePosePairer is given the real per-camera calibration
 (config/camera_intrinsics.yaml, via CameraCalibrationConfig), so R,
 t are the camera pose in the odom frame.
 
-IMAGE ORIENTATION: both RGB and depth for THIS testset are rotated
-180 degrees in load_frame() -- see the same note in test_grid_map.py.
-They currently look upright (display orientation) rather than native,
-and PointCloudBuilder.build() pairs each depth pixel's semantic label
-using the SAME (row, col) index on both arrays with no internal
-rotation, so RGB and depth must stay pixel-aligned with each other
-AND match the native orientation the extrinsics assume.
+IMAGE ORIENTATION: same as test_grid_map.py -- files are used exactly
+as spot_rgb_depth_log.py saves them (NATIVE raster), nothing is
+rotated here. PointCloudBuilder turns only the RGB upright for
+SegFormer and maps the probabilities back to native. Do NOT rotate
+the files: a 180 deg rotation keeps the shape, so build() cannot
+detect it, and the geometry would come out flipped.
+
+HEIGHT DATUM: irrelevant here -- planning uses the cost layer and
+(x, y) positions only; the costs are built from height differences.
 
 Robot position used for planning: the robot BODY position at the
 LAST frame ("where the robot ended up"), recovered from the camera
@@ -55,14 +57,12 @@ from pipeline.planning_pipeline import PlanningPipeline
 
 def load_frame(rgb_path, depth_path):
     """
-    Undo the 180-degree rotation on BOTH RGB and depth for THIS
-    testset (see the IMAGE ORIENTATION note at the top of this file).
+    Load RGB and depth exactly as Spot saved them (NATIVE raster),
+    see the IMAGE ORIENTATION note at the top of this file.
     """
 
     rgb = np.array(Image.open(rgb_path).convert("RGB"))
     depth = np.array(Image.open(depth_path))
-    rgb = np.rot90(rgb, k=2)
-    depth = np.rot90(depth, k=2)
 
     return rgb, depth
 
@@ -111,7 +111,7 @@ if __name__ == "__main__":
 
     # Which camera this dataset's testset/images + testset/depths
     # came from -- change this if you test a different camera.
-    camera_name = "right"
+    camera_name = "frontleft"
 
     # -------------------------------------------------------------
     # Pair real frames with real poses (true camera pose), fuse
