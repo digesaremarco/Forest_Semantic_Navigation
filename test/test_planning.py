@@ -26,6 +26,16 @@ within how far the robot moved between those frames.
 HEIGHT DATUM: irrelevant here -- planning uses the cost layer and
 (x, y) positions only; the costs are built from height differences.
 
+INFLATION / STATUS: also prints PlanningPipeline.last_status (why a
+None result happened), every rejected candidate with its reason, and
+how much area the obstacle inflation blocks; saves planning_cost.png
+(the cost A* actually searches: C_total combined with the soft
+inflation, impassable cells drawn at 1.0).
+
+RETURN HOME (RETURN_HOME_CHECK): plan_to_goal() from where the robot
+ended up back to where the run started (body position at the FIRST
+frame) -- the path the main loop would use at the end of a mission.
+
 Because nothing is rebuilt, rerun it freely after changing
 planning_config.yaml, costmap_config.yaml or class_costs.yaml. If
 grid_map_config.yaml or the retained classes changed, GridMap.load()
@@ -63,6 +73,9 @@ TRAJECTORY_PATH = OUTPUT_DIR / "trajectory.npz"
 
 # Whether to also open the plot on screen (it is always saved).
 SHOW_PLOTS = True
+
+# Also plan the way back to the start of the run.
+RETURN_HOME_CHECK = True
 
 
 # -----------------------------------------------------------------
@@ -170,22 +183,61 @@ def robot_position_from_trajectory(trajectory, camera_calibration):
     return float(last_body[0]), float(last_body[1])
 
 
-def print_planning_result(detection, result):
+def print_inflation(planning_pipeline, grid_map):
+    """How much the obstacle inflation restricts the search."""
+
+    context = planning_pipeline.last_context
+
+    if context is None:
+        return
+
+    config = planning_pipeline.planning_config
+    occupied = planning_pipeline.last_detection["occupied"]
+    blocked = context["blocked"]
+    cell_area = grid_map.resolution ** 2
+
+    section("Obstacle inflation")
+
+    print(
+        f"robot_radius {config.robot_radius_m} m, soft zone "
+        f"{config.inflation_radius_m} m (max cost {config.inflation_max_cost})"
+    )
+    print(f"Occupied cells:     {int(occupied.sum()):>7} ({occupied.sum() * cell_area:.2f} m2)")
+    print(f"Impassable cells:   {int(blocked.sum()):>7} ({blocked.sum() * cell_area:.2f} m2)")
+    print(f"Occupied cells cleared under the robot: {context['occupied_cleared_under_robot']}")
+
+
+def print_rejections(planning_pipeline, grid_map):
+    if not planning_pipeline.last_rejections:
+        return
+
+    print("\nRejected candidates:")
+
+    for rejection in planning_pipeline.last_rejections:
+        x, y = grid_map.cell_to_world(*rejection["cell"])
+        print(f"  [{rejection['stage']:<9}] ({x:+.2f}, {y:+.2f}): {rejection['reason']}")
+
+
+def print_planning_result(planning_pipeline, grid_map, result):
     """Frontiers found and, if any, the selected one and its path."""
+
+    detection = planning_pipeline.last_detection
 
     section("Planning result")
 
+    print("Status:", planning_pipeline.last_status)
     print("Frontier clusters found:", len(detection["clusters"]))
 
     for cluster in detection["clusters"]:
         print(f"  size={cluster['size']}, centroid={cluster['centroid']}")
 
+    print_rejections(planning_pipeline, grid_map)
+
     if result is None:
         print(
-            "\nplan() returned None -- see the frontier count above for "
-            "whether any frontier was found at all, and the module "
-            "docstring for why a found frontier can still lead to no "
-            "plan on a single recorded run."
+            "\nplan() returned None -- see the status and rejections "
+            "above, and the module docstring for why a found frontier "
+            "can still lead to no plan on a single recorded run."
         )
         return
 
@@ -198,11 +250,64 @@ def print_planning_result(detection, result):
     print("  utility:", frontier["utility"])
     print("  refined_centroid (cell):", frontier["refined_centroid"])
 
-    print("\nPath length (cells, after smoothing):", len(result["path_cells"]))
+    print("\nTarget (world):", tuple(round(v, 3) for v in result["goal_world"]))
+    print("Path length (cells, after smoothing):", len(result["path_cells"]))
     print("Number of waypoints:", len(result["waypoints"]))
 
     for wp in result["waypoints"]:
         print(f"  position={wp['position']}, heading={wp['heading']:.3f} rad")
+
+
+def start_position_from_trajectory(trajectory, camera_calibration):
+    """(x, y) of the body at the FIRST frame of the run."""
+
+    first = body_position(trajectory[0], camera_calibration)
+
+    return float(first[0]), float(first[1])
+
+
+def return_home_check(planning_pipeline, grid_map, cost_layer, robot_position, home_position):
+    section("Return home")
+
+    result = planning_pipeline.plan_to_goal(
+        home_position, cost_layer, robot_position,
+        grid_map.resolution, grid_map.get_origin()[:2], grid_map.cell_n
+    )
+
+    print(f"From ({robot_position[0]:+.2f}, {robot_position[1]:+.2f}) "
+          f"to ({home_position[0]:+.2f}, {home_position[1]:+.2f})")
+    print("Status:", planning_pipeline.last_status)
+
+    print_rejections(planning_pipeline, grid_map)
+
+    if result is not None:
+        print("Goal used:", tuple(round(v, 3) for v in result["goal_world"]))
+        print("Number of waypoints:", len(result["waypoints"]))
+
+    return result
+
+
+def save_planning_cost_plot(planning_pipeline, grid_map, path):
+    """The cost A* searches, impassable cells drawn at 1.0."""
+
+    import matplotlib.pyplot as plt
+    from mapping.grid_map_visualizer import GridMapVisualizer
+
+    context = planning_pipeline.last_context
+
+    if context is None:
+        return
+
+    layer = context["cost"].copy()
+    layer[context["blocked"]] = 1.0
+
+    fig, ax = GridMapVisualizer(grid_map).plot_cost_heatmap(layer, kind="total")
+    ax.set_title("Planning cost: C_total + inflation (impassable = 1.0)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved {path}")
 
 
 # -----------------------------------------------------------------
@@ -259,13 +364,18 @@ def main():
 
     detection = planning_pipeline.last_detection
 
-    print_planning_result(detection, result)
+    print_inflation(planning_pipeline, grid_map)
+    print_planning_result(planning_pipeline, grid_map, result)
+
+    section("Plots")
+
+    # The inflation plot is saved now: the return-home check below
+    # replaces last_context.
+    save_planning_cost_plot(planning_pipeline, grid_map, OUTPUT_DIR / "planning_cost.png")
 
     # -------------------------------------------------------------
     # Plot (saved, optionally shown)
     # -------------------------------------------------------------
-
-    section("Plots")
 
     plot_path = OUTPUT_DIR / "planning.png"
 
@@ -280,6 +390,18 @@ def main():
     )
 
     print(f"Saved {plot_path}")
+
+    # -------------------------------------------------------------
+    # Return home
+    # -------------------------------------------------------------
+
+    if RETURN_HOME_CHECK:
+        home_position = start_position_from_trajectory(trajectory, camera_calibration)
+
+        return_home_check(
+            planning_pipeline, grid_map, cost_layer,
+            robot_position_world, home_position
+        )
 
 
 if __name__ == "__main__":

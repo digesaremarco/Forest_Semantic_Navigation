@@ -88,3 +88,49 @@ replanning:
   # Trigger a replan if this many seconds pass without reaching the
   # goal.
   timeout_s: 30.0
+
+obstacle_inflation:
+  # Spot is planned as a disc of this radius: occupied cells are
+  # dilated by it, and the dilated area is IMPASSABLE for A* and the
+  # path smoother (planning/obstacle_inflation.py). Spot's body is
+  # about 1.1 x 0.5 m: half its width (0.25 m) is the bare minimum,
+  # half its length (~0.55 m) would close most forest passages. 0.35
+  # leaves ~10 cm per side when walking straight through a gap, i.e.
+  # the narrowest passage planned through is 2 * 0.35 = 0.7 m.
+  robot_radius_m: 0.35
+
+  # Soft zone beyond robot_radius_m: an extra cost, linear from
+  # inflation_max_cost at the hard edge to 0 at robot_radius_m +
+  # inflation_radius_m, combined with C_total by max(). Keeps paths in
+  # the middle of passages instead of grazing the hard limit. 0
+  # disables the soft zone.
+  inflation_radius_m: 0.5
+  inflation_max_cost: 0.6
+
+  # The robot stands on its own cells: inflated (or occupied, e.g. a
+  # cost artifact under the legs) cells within this radius of the
+  # start are made traversable again before planning.
+  start_clear_radius_m: 0.35
+
+  # A target (frontier or return-home goal) inside the impassable area
+  # is moved to the nearest traversable cell within this radius; if
+  # there is none, the target is discarded.
+  goal_snap_radius_m: 0.5
+
+target_selection:
+  # plan() tries the frontier candidates in decreasing utility, up to
+  # this many, until A* finds a path to one of them.
+  max_plan_attempts: 3
+
+  # Frontier targets closer than this to the robot are ignored. The
+  # body cameras do not see the ground right under and around Spot, so
+  # that ring stays unknown after every stop and would otherwise be
+  # the "nearest frontier" each time. Each cluster is retargeted to
+  # its nearest cell at least this far away; clusters with none are
+  # dropped.
+  min_target_distance_m: 0.75
+
+  # Frontier targets within this distance of a blacklisted point (a
+  # target the robot failed to reach, see
+  # PlanningPipeline.blacklist_target()) are discarded.
+  blacklist_radius_m: 0.75

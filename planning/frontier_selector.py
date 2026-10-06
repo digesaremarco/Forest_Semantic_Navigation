@@ -15,8 +15,13 @@ Navigation cost (per candidate) is a CHEAP ESTIMATE, not a real A*
 search: euclidean distance from the robot's current position to the
 candidate, scaled by (1 + average cost sampled along the straight
 line between them). Running full A* on every candidate just to
-discard most of them would be wasteful -- A* itself only runs once,
-in PathPlanner, on the single frontier this module selects.
+discard most of them would be wasteful -- A* only runs on the
+best-ranked candidates, in PathPlanner.
+
+RANKING: rank() returns ALL candidates sorted by decreasing utility,
+so PlanningPipeline can fall back to the next-best frontier when A*
+fails on the best one; select() is kept as the best-only shortcut
+(rank()[0]).
 
 Both raw scores are normalized by their own maximum across the
 CURRENT candidate set (min-max style, so whichever frontier has the
@@ -42,6 +47,18 @@ class FrontierSelector:
 
     def select(self, refined_clusters, cost_layer, unknown_mask, robot_position):
         """
+        Best candidate only: rank()[0], or None if there are none.
+        Same parameters as rank().
+        """
+
+        ranked = self.rank(
+            refined_clusters, cost_layer, unknown_mask, robot_position
+        )
+
+        return ranked[0] if ranked else None
+
+    def rank(self, refined_clusters, cost_layer, unknown_mask, robot_position):
+        """
         Parameters
         ----------
         refined_clusters : list of dict
@@ -60,15 +77,15 @@ class FrontierSelector:
 
         Returns
         -------
-        dict or None
-            The selected cluster (one of refined_clusters, with
-            "information_gain", "navigation_cost",
-            "navigation_distance" and "utility" keys added), or None
-            if refined_clusters is empty.
+        list of dict
+            Copies of refined_clusters, each with "information_gain",
+            "navigation_cost", "navigation_distance" and "utility"
+            keys added, sorted by decreasing utility. Empty if
+            refined_clusters is empty.
         """
 
         if len(refined_clusters) == 0:
-            return None
+            return []
 
         radius = self.planning_config.information_gain_radius_cells
         nan_penalty = self.planning_config.nan_cost_penalty
@@ -108,7 +125,8 @@ class FrontierSelector:
                 - self.planning_config.beta_cost * normalized_cost
             )
 
-        return max(scored, key=lambda item: item["utility"])
+        # Stable sort: equal utilities keep the input order.
+        return sorted(scored, key=lambda item: item["utility"], reverse=True)
 
     @staticmethod
     def information_gain(centroid, unknown_mask, radius):

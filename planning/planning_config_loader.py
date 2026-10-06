@@ -31,6 +31,8 @@ class PlanningConfig:
         self.load_waypoint_generation()
         self.load_path_smoothing()
         self.load_replanning()
+        self.load_obstacle_inflation()
+        self.load_target_selection()
 
     def load_frontier_detection(self):
         section = self._config.get("frontier_detection")
@@ -203,6 +205,84 @@ class PlanningConfig:
             section.get("timeout_s"),
             "replanning.timeout_s"
         )
+
+    def load_obstacle_inflation(self):
+        section = self._config.get("obstacle_inflation")
+
+        if section is None:
+            raise ValueError(
+                "Missing 'obstacle_inflation' section in "
+                f"{self.config_path}."
+            )
+
+        self.robot_radius_m = self.validate_positive_number(
+            section.get("robot_radius_m"),
+            "obstacle_inflation.robot_radius_m"
+        )
+
+        self.inflation_radius_m = self.validate_non_negative_number(
+            section.get("inflation_radius_m"),
+            "obstacle_inflation.inflation_radius_m"
+        )
+
+        self.inflation_max_cost = self.validate_non_negative_number(
+            section.get("inflation_max_cost"),
+            "obstacle_inflation.inflation_max_cost"
+        )
+
+        if self.inflation_max_cost > 1.0:
+            raise ValueError(
+                "obstacle_inflation.inflation_max_cost must be in [0, 1], "
+                f"got {self.inflation_max_cost}."
+            )
+
+        self.start_clear_radius_m = self.validate_non_negative_number(
+            section.get("start_clear_radius_m"),
+            "obstacle_inflation.start_clear_radius_m"
+        )
+
+        self.goal_snap_radius_m = self.validate_non_negative_number(
+            section.get("goal_snap_radius_m"),
+            "obstacle_inflation.goal_snap_radius_m"
+        )
+
+    def load_target_selection(self):
+        section = self._config.get("target_selection")
+
+        if section is None:
+            raise ValueError(
+                "Missing 'target_selection' section in "
+                f"{self.config_path}."
+            )
+
+        self.max_plan_attempts = self.validate_positive_int(
+            section.get("max_plan_attempts"),
+            "target_selection.max_plan_attempts"
+        )
+
+        self.min_target_distance_m = self.validate_non_negative_number(
+            section.get("min_target_distance_m"),
+            "target_selection.min_target_distance_m"
+        )
+
+        self.blacklist_radius_m = self.validate_positive_number(
+            section.get("blacklist_radius_m"),
+            "target_selection.blacklist_radius_m"
+        )
+
+    @staticmethod
+    def validate_non_negative_number(value, parameter_name):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(
+                f"{parameter_name} must be a numeric value."
+            )
+
+        if value < 0:
+            raise ValueError(
+                f"{parameter_name} must be >= 0."
+            )
+
+        return float(value)
 
     @staticmethod
     def validate_positive_number(value, parameter_name):
