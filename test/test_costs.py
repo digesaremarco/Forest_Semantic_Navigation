@@ -1,29 +1,24 @@
 """
-Throwaway diagnostic script: fuse the real field dataset (paired
-RGB/depth/pose frames) into GridMap, compute GeometricCost and
-SemanticCost, fuse them with CostFusion, and visualize everything.
+Compute the traversability costs on a saved GridMap and plot them.
 
-Purpose: eyeball whether the current thresholds (costmap_config.yaml)
-and per-class costs (class_costs.yaml) look reasonable on real
-terrain, and how much CostFusion's per-cell fallback actually kicks
-in in practice. Not meant to be kept around -- delete once you've
-looked at the plots.
+Loads the map written by test_grid_map.py (no pairing, no SegFormer,
+no fusion), computes GeometricCost, SemanticCost and their CostFusion,
+prints how often CostFusion's per-cell fallback kicks in, and shows:
 
-Geometry: same setup as test_grid_map.py. FramePosePairer is given
-the real per-camera calibration (config/camera_intrinsics.yaml, via
-CameraCalibrationConfig), so R, t are the camera pose in the odom
-frame.
+    1. geometric cost (C_geo)
+    2. semantic cost (C_sem)
+    3. fused cost (C_total)
+    4. the geometric cost components: slope, roughness, step
 
-IMAGE ORIENTATION: same as test_grid_map.py -- files are used exactly
-as spot_rgb_depth_log.py saves them (NATIVE raster), nothing is
-rotated here. PointCloudBuilder turns only the RGB upright for
-SegFormer and maps the probabilities back to native. Do NOT rotate
-the files: a 180 deg rotation keeps the shape, so build() cannot
-detect it, and the geometry would come out flipped.
+Because the map is loaded, not rebuilt, this runs in seconds and
+always evaluates the SAME map test_grid_map.py produced: rerun it
+freely after changing costmap_config.yaml or class_costs.yaml. If
+grid_map_config.yaml changed (resolution, map_length) or the retained
+classes did, GridMap.load() refuses the file: rebuild the map first.
 
-HEIGHT DATUM: get_elevation_layer() is relative to the ground under
-the starting pose (grid_map_config.yaml, height_datum). The costs do
-not depend on it: slope, roughness and step are height differences.
+HEIGHT DATUM: the elevation is relative to the ground under the
+starting pose; the costs do not depend on it (slope, roughness and
+step are height differences).
 """
 
 import sys
@@ -31,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -39,9 +33,6 @@ sys.path.append(str(PROJECT_ROOT))
 
 from perception.perception_config_loader import PerceptionConfig
 from perception.class_reducer import ClassReducer
-from fusion.camera_calibration_loader import CameraCalibrationConfig
-from fusion.pointcloud_builder import PointCloudBuilder
-from fusion.frame_pose_pairing import FramePosePairer
 from mapping.grid_map_config_loader import GridMapConfig
 from mapping.grid_map import GridMap
 from mapping.grid_map_visualizer import GridMapVisualizer
@@ -51,225 +42,160 @@ from costmap.semantic_cost import SemanticCost
 from costmap.cost_fusion import CostFusion
 
 
-def load_frame(rgb_path, depth_path):
+# Map written by test_grid_map.py; plots are saved next to it.
+MAP_PATH = PROJECT_ROOT / "oggi2" / "output" / "grid_map.npz"
+OUTPUT_DIR = MAP_PATH.parent
+
+# Saved figures: resolution, and whether to also open them on screen.
+FIGURE_DPI = 200
+SHOW_PLOTS = True
+
+
+def plot_layer(visualizer, layer, ax, title, cmap="inferno", vmin=0.0, vmax=1.0):
     """
-    Load RGB and depth exactly as Spot saved them (NATIVE raster),
-    see the IMAGE ORIENTATION note at the top of this file.
-    """
-
-    rgb = np.array(Image.open(rgb_path).convert("RGB"))
-    depth = np.array(Image.open(depth_path))
-
-    return rgb, depth
-
-
-def get_field(pc, key):
-    if key not in pc:
-        raise KeyError(
-            f"PointCloudBuilder.build() output has no '{key}' key. "
-            f"Available keys: {list(pc.keys())}"
-        )
-
-    return pc[key]
-
-
-def plot_layer(visualizer, layer, ax, title, cmap="viridis", vmin=None, vmax=None):
-    """
-    Crop `layer` to the grid's observed bounding box (reusing
-    GridMapVisualizer's own crop/extent logic, so this matches
-    plot_elevation_heatmap exactly) and draw it as a heatmap.
+    Heatmap of a (H, W) layer cropped to the observed cells, reusing
+    GridMapVisualizer's crop/extent logic so it lines up exactly with
+    the visualizer's own plots.
     """
 
     row_slice, col_slice = visualizer.resolve_crop(crop_to_observed=True)
-    view = layer[row_slice, col_slice]
     extent = visualizer.compute_extent(row_slice, col_slice)
 
     im = ax.imshow(
-        np.ma.masked_invalid(view),
+        np.ma.masked_invalid(layer[row_slice, col_slice]),
         cmap=cmap,
         origin="lower",
         extent=extent,
         vmin=vmin,
-        vmax=vmax
+        vmax=vmax,
+        interpolation="nearest"
     )
 
     ax.set_title(title)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
+    ax.set_aspect("equal")
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, label="cost")
 
-    plt.colorbar(im, ax=ax, fraction=0.046)
 
-
-if __name__ == "__main__":
-
-    # -------------------------------------------------------------
-    # Configuration
-    # -------------------------------------------------------------
-
-    perception_config = PerceptionConfig(
-        PROJECT_ROOT / "config" / "perception_config.yaml"
-    )
-
-    grid_map_config = GridMapConfig(
-        PROJECT_ROOT / "config" / "grid_map_config.yaml"
-    )
-
-    costmap_config = CostmapConfig(
-        PROJECT_ROOT / "config" / "costmap_config.yaml",
-        PROJECT_ROOT / "config" / "class_costs.yaml"
-    )
-
-    camera_calibration = CameraCalibrationConfig(
-        PROJECT_ROOT / "config" / "camera_intrinsics.yaml"
-    )
-
-    # Which camera this dataset's testset/images + testset/depths
-    # came from -- change this if you test a different camera.
-    camera_name = "frontleft"
-
-    # -------------------------------------------------------------
-    # Pair real frames with real poses (true camera pose)
-    # -------------------------------------------------------------
-
-    pairer = FramePosePairer(
-        rgb_dir=PROJECT_ROOT / "testset" / "images",
-        depth_dir=PROJECT_ROOT / "testset" / "depths",
-        pose_csv_path=PROJECT_ROOT / "testset" / "pose" / "odometry_log.csv",
-        max_pose_dt=1.0,
-        camera_calibration=camera_calibration,
-        camera_name=camera_name
-    )
-
-    paired_frames = pairer.pair()
-
-    # -------------------------------------------------------------
-    # Build the pipeline and fuse every frame into the grid
-    # -------------------------------------------------------------
-
-    builder = PointCloudBuilder(perception_config, camera_calibration)
-    class_reducer = ClassReducer(perception_config)
-    grid_map = GridMap(grid_map_config, class_reducer)
-
-    print(f"\nFusing {len(paired_frames)} real frame(s) into the grid map...\n")
-
-    for frame in paired_frames:
-        rgb, depth = load_frame(frame["rgb_path"], frame["depth_path"])
-
-        pc = builder.build(rgb, depth, camera_name)
-
-        points_xyz = get_field(pc, "points_xyz").astype(np.float32, copy=False)
-        semantic_colors = get_field(pc, "semantic_colors").astype(np.uint8, copy=False)
-        semantic_probs = get_field(pc, "semantic_probs").astype(np.float32, copy=False)
-
-        grid_map.update(
-            points_xyz, semantic_colors, semantic_probs,
-            frame["R"], frame["t"]
-        )
-
-        print(f"{frame['rgb_path'].name}: {points_xyz.shape[0]} points")
-
-    print()
-
-    # -------------------------------------------------------------
-    # Compute both costs, then fuse them
-    # -------------------------------------------------------------
+def print_diagnostics(grid_map, geo_cost, sem_cost, fused_cost):
+    """Valid cells per cost and how CostFusion combined them."""
 
     elevation = grid_map.get_elevation_layer()
-    semantic_probs_layer = grid_map.get_semantic_probs_layer()
-    count = grid_map.get_count_layer()
 
-    geometric_cost = GeometricCost(costmap_config)
-    geo_result = geometric_cost.compute(elevation, resolution=grid_map.resolution)
-
-    semantic_cost = SemanticCost(costmap_config, class_reducer)
-    sem_cost = semantic_cost.compute(semantic_probs_layer)
-
-    cost_fusion = CostFusion(costmap_config)
-    fused_cost = cost_fusion.compute(geo_result["cost"], sem_cost)
-
-    # -------------------------------------------------------------
-    # Diagnostics
-    # -------------------------------------------------------------
-
-    geo_valid = np.isfinite(geo_result["cost"])
+    geo_valid = np.isfinite(geo_cost)
     sem_valid = np.isfinite(sem_cost)
-
-    both = int(np.sum(geo_valid & sem_valid))
-    only_geo = int(np.sum(geo_valid & ~sem_valid))
-    only_sem = int(np.sum(sem_valid & ~geo_valid))
-    neither = int(np.sum(~geo_valid & ~sem_valid))
 
     datum = grid_map.get_height_datum()
 
+    print("\n" + "-" * 60)
+    print("Costs")
+    print("-" * 60)
     print(
         "Height datum:",
         "none (raw odom heights)" if datum is None
         else f"{datum:+.3f} m odom z (elevation 0 = ground at start)"
     )
-    print(
-        "Elevation [m] min/max:",
-        np.nanmin(elevation), np.nanmax(elevation)
+    print("Elevation [m] min/max:", np.nanmin(elevation), np.nanmax(elevation))
+    print("Elevation observed cells:", int(np.isfinite(elevation).sum()))
+    print("C_geo valid cells:       ", int(geo_valid.sum()))
+    print("C_sem valid cells:       ", int(sem_valid.sum()))
+
+    print("\nFusion breakdown:")
+    print(f"  both available (weighted avg): {int(np.sum(geo_valid & sem_valid))}")
+    print(f"  only C_geo (fallback):         {int(np.sum(geo_valid & ~sem_valid))}")
+    print(f"  only C_sem (fallback):         {int(np.sum(sem_valid & ~geo_valid))}")
+
+    for name, layer in (("C_geo", geo_cost), ("C_sem", sem_cost), ("C_total", fused_cost)):
+        if np.any(np.isfinite(layer)):
+            print(f"{name + ' range:':<15}{np.nanmin(layer):.3f} - {np.nanmax(layer):.3f}")
+        else:
+            print(f"{name + ' range:':<15}no valid cells")
+
+
+def main():
+    perception_config = PerceptionConfig(
+        PROJECT_ROOT / "config" / "perception_config.yaml"
     )
-    print("Elevation observed cells:", np.isfinite(elevation).sum())
-    print("C_geo observed cells:    ", int(geo_valid.sum()))
-    print("C_sem observed cells:    ", int(sem_valid.sum()))
-    print()
-    print("Fusion breakdown:")
-    print(f"  both available (weighted avg): {both}")
-    print(f"  only C_geo (fallback):         {only_geo}")
-    print(f"  only C_sem (fallback):         {only_sem}")
-    print(f"  neither (NaN):                 {neither}")
-    print()
-    print("C_geo range:  ", np.nanmin(geo_result["cost"]), "-", np.nanmax(geo_result["cost"]))
-    print("C_sem range:  ", np.nanmin(sem_cost), "-", np.nanmax(sem_cost))
-    print("C_total range:", np.nanmin(fused_cost), "-", np.nanmax(fused_cost))
+    grid_map_config = GridMapConfig(
+        PROJECT_ROOT / "config" / "grid_map_config.yaml"
+    )
+    costmap_config = CostmapConfig(
+        PROJECT_ROOT / "config" / "costmap_config.yaml",
+        PROJECT_ROOT / "config" / "class_costs.yaml"
+    )
 
     # -------------------------------------------------------------
-    # Visualize: elevation, C_geo, C_sem, C_total / slope, roughness,
-    # step, observation count
+    # Load the map
+    # -------------------------------------------------------------
+
+    class_reducer = ClassReducer(perception_config)
+    grid_map = GridMap(grid_map_config, class_reducer)
+    grid_map.load(MAP_PATH)
+
+    # -------------------------------------------------------------
+    # Compute the costs
+    # -------------------------------------------------------------
+
+    geo_result = GeometricCost(costmap_config).compute(
+        grid_map.get_elevation_layer(), resolution=grid_map.resolution
+    )
+
+    sem_cost = SemanticCost(costmap_config, class_reducer).compute(
+        grid_map.get_semantic_probs_layer()
+    )
+
+    fused_cost = CostFusion(costmap_config).compute(geo_result["cost"], sem_cost)
+
+    print_diagnostics(grid_map, geo_result["cost"], sem_cost, fused_cost)
+
+    # -------------------------------------------------------------
+    # Plots, one figure each
     # -------------------------------------------------------------
 
     visualizer = GridMapVisualizer(grid_map)
+    figures = {}
 
-    fig, axes = plt.subplots(2, 4, figsize=(25, 11))
+    for layer, kind in (
+        (geo_result["cost"], "geo"),
+        (sem_cost, "sem"),
+        (fused_cost, "total"),
+    ):
+        fig, _ = visualizer.plot_cost_heatmap(layer, kind=kind)
+        fig.tight_layout()
+        figures[f"cost_{kind}.png"] = fig
 
-    visualizer.plot_elevation_heatmap(ax=axes[0, 0])
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("Geometric cost components")
 
-    plot_layer(
-        visualizer, geo_result["cost"], axes[0, 1],
-        "Geometric cost (C_geo)", cmap="inferno", vmin=0, vmax=1
-    )
+    for ax, key, title in zip(
+        axes,
+        ("slope_cost", "roughness_cost", "step_cost"),
+        ("Slope cost", "Roughness cost", "Step cost"),
+    ):
+        plot_layer(visualizer, geo_result[key], ax, title)
 
-    plot_layer(
-        visualizer, sem_cost, axes[0, 2],
-        "Semantic cost (C_sem)", cmap="inferno", vmin=0, vmax=1
-    )
+    fig.tight_layout()
+    figures["cost_geo_components.png"] = fig
 
-    plot_layer(
-        visualizer, fused_cost, axes[0, 3],
-        "Fused cost (C_total)", cmap="inferno", vmin=0, vmax=1
-    )
+    # -------------------------------------------------------------
+    # Save (before show(): closing the windows discards the figures)
+    # -------------------------------------------------------------
 
-    plot_layer(
-        visualizer, geo_result["slope_cost"], axes[1, 0],
-        "Slope cost", cmap="inferno", vmin=0, vmax=1
-    )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    plot_layer(
-        visualizer, geo_result["roughness_cost"], axes[1, 1],
-        "Roughness cost", cmap="inferno", vmin=0, vmax=1
-    )
+    print()
 
-    plot_layer(
-        visualizer, geo_result["step_cost"], axes[1, 2],
-        "Step cost", cmap="inferno", vmin=0, vmax=1
-    )
+    for filename, fig in figures.items():
+        path = OUTPUT_DIR / filename
+        fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+        print(f"Saved {path}")
 
-    # Unobserved cells (count == 0) shown blank, like the other layers.
-    plot_layer(
-        visualizer, np.where(count > 0, count, np.nan), axes[1, 3],
-        "Observation count", cmap="magma"
-    )
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close("all")
 
-    plt.tight_layout()
-    plt.show()
+
+if __name__ == "__main__":
+    main()

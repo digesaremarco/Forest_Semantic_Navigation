@@ -1,67 +1,61 @@
 """
-Test entry point for GridMap, using real field data.
+Build a GridMap from real field data, save it and plot it.
 
-Runs GridMap.update() over every (RGB, depth, pose) triplet produced
-by FramePosePairer, i.e. real frames from testset/images +
-testset/depths, each fused with the closest pose logged in
-testset/pose/odometry_log.csv -- no synthetic trajectory involved
-anymore.
+Exercises the full fusion pipeline end to end (pairing -> point cloud
+-> GridMap) on a recorded run, writes the result to disk and saves
+the map plots. Intended for offline field-data testing only, not part
+of the live Spot pipeline.
 
-CAMERA POSE: FramePosePairer is given the real per-camera
-calibration (config/camera_intrinsics.yaml, via
-CameraCalibrationConfig), so R, t returned for each frame are the
-TRUE camera pose in the odom frame (odom_tform_camera), not the body
-pose. This matters because points_xyz from PointCloudBuilder are in
-the camera OPTICAL frame (x right, y down, z forward): applying the
-body pose directly would map depth onto the world's vertical axis
-(producing upward "cones").
+INPUT: <DATA_ROOT>/images_rgb/<camera>/, <DATA_ROOT>/depth_data/<camera>/
+and <DATA_ROOT>/odometry/odometry_log.csv, as written by
+spot_rgb_depth_log.py (AUTO_ROTATE = False).
 
-NOISE MODEL: GridMap weights each point by the inverse of a
-depth-dependent variance, sigma^2 = sigma0^2 + alpha * z^p, read
-from the 'noise' section of grid_map_config.yaml. z is the depth
-along the optical axis (points_xyz[:, 2]), the quantity the model
-was calibrated on (fit_depth_noise.py) and the same one the 4 m
-point cloud pre-filter cuts on. If PointCloudBuilder ever starts
-returning points in a frame other than the camera optical frame,
-the weights become wrong silently -- the sanity check below prints
-depth and per-point weights so this is easy to spot. The 3D
-distance is printed too, for information only: with the wide-FOV
-cameras it exceeds the depth off-axis and can go beyond 4 m.
+OUTPUT (in OUTPUT_DIR):
+    grid_map.npz     GridMap.save() state: raw accumulators, origin,
+                     height datum, noise model, class order. Reload
+                     with GridMap(same config, ClassReducer).load().
+    trajectory.npz   One entry per paired frame, in fusion order:
+                     timestamp, camera_name, R, t (camera pose in
+                     odom), fused (bool, False = skipped keyframe).
+                     For overlaying the path on the map later.
+    elevation.png         Elevation heatmap (top-down).
+    semantic_topdown.png  Winning class per cell, top-down, legend.
+    semantic_3d.png       Matplotlib 3D scatter, winning class, legend
+                          (subsampled above PLOT_3D_MAX_POINTS cells).
+    semantic_3d.html      Interactive Plotly 3D scatter, legend, full
+                          map; open it in a browser.
 
-KEYFRAMES: a frame is fused only if the camera moved at least
-KEYFRAME_MIN_TRANSLATION or rotated at least KEYFRAME_MIN_ROTATION_DEG
-since the last FUSED frame. Without this, frames recorded while the
-robot stands still (e.g. 20260914_145610 .. 145628 in this testset)
-multiply the weight of the same area without adding information:
-they repeat the same correlated stereo errors, inflate the cells'
-confidence and dominate the no-forgetting fusion. Skipped frames
-are not even run through PointCloudBuilder, saving inference time.
+MULTI-CAMERA: every camera in CAMERA_NAMES is fused into the SAME
+grid. One FramePosePairer per camera (own folders, own extrinsics);
+frames of all cameras are merged in chronological order, so the grid
+origin and height datum anchor on the earliest frame of the run, and
+each frame is fused with ITS OWN camera_name (intrinsics, depth_scale,
+upright rotation for SegFormer).
 
-A/B COMPARISON: when COMPARE_WITH_UNWEIGHTED is True, a second
-GridMap with noise_alpha = 0 (every point weight 1, i.e. the old
-plain-mean behavior) is fused from the same point clouds, and the
-two maps are compared at the end. Small differences mean point
-density was already doing most of the near/far weighting.
+CAMERA POSE: FramePosePairer composes odom_tform_body with the static
+body_tform_camera, so R, t are the TRUE camera pose in odom.
+points_xyz from PointCloudBuilder are in the camera OPTICAL frame
+(x right, y down, z forward).
 
-IMAGE ORIENTATION: the testset files are used exactly as
-spot_rgb_depth_log.py saves them (AUTO_ROTATE = False), i.e. in each
-camera's NATIVE raster -- the one the calibration refers to. Nothing
-is rotated here. PointCloudBuilder turns only the RGB upright for
-SegFormer (UPRIGHT_ROT90_K: right 180 deg, front cameras ~90 deg)
-and maps the probabilities back to native; depth and backprojection
-stay native. Do NOT feed files rotated for display: build() rejects
-them when the shape no longer matches, but a 180 deg rotation keeps
-the shape and would silently flip the geometry.
+NOISE MODEL: GridMap weights each point by the inverse of
+sigma^2 = sigma0^2 + alpha * z^p, z = depth along the optical axis
+(grid_map_config.yaml, 'noise'). The sanity check prints depth and
+weights per camera, so a point cloud returned in the wrong frame is
+easy to spot.
 
-MULTI-CAMERA FOLDERS: testset/images and testset/depths may hold
-every camera of each shot (same timestamp, camera in the filename);
-FramePosePairer selects camera_name's files only.
+KEYFRAMES: a frame is fused only if ITS camera moved >=
+KEYFRAME_MIN_TRANSLATION or rotated >= KEYFRAME_MIN_ROTATION_DEG since
+the last frame fused from that same camera. Static frames would repeat
+the same correlated stereo errors and inflate the cells' confidence.
+Skipped frames never reach PointCloudBuilder.
 
-This script is intended for offline field-data testing only. It is
-not part of the live Spot pipeline.
+IMAGE ORIENTATION: files are used exactly as Spot saved them (NATIVE
+raster). PointCloudBuilder turns only the RGB upright for SegFormer
+and maps the probabilities back. Do NOT feed files rotated for
+display: a 180 deg rotation keeps the shape and would silently flip
+the geometry.
 """
 
-import copy
 import sys
 from pathlib import Path
 
@@ -83,28 +77,38 @@ from mapping.grid_map import GridMap
 from mapping.grid_map_visualizer import GridMapVisualizer
 
 
-# Fuse a second, unweighted map (noise_alpha = 0) from the same
-# point clouds and compare it with the weighted one.
-COMPARE_WITH_UNWEIGHTED = True
+# Cameras fused into the same grid. 'back' is left out on purpose.
+CAMERA_NAMES = ["frontleft", "frontright", "left", "right"]
 
-# Elevation difference [m] above which a cell is counted as
-# "changed" by the weighting in the A/B report.
-AB_DIFF_THRESHOLD = 0.02
+# Dataset layout: <DATA_ROOT>/images_rgb/<camera>/, depth_data/<camera>/
+# and odometry/odometry_log.csv.
+DATA_ROOT = PROJECT_ROOT / "oggi2"
 
-# Keyframe selection: fuse a frame only if the camera moved or
-# rotated at least this much since the last fused frame.
+# Where grid_map.npz and trajectory.npz are written.
+OUTPUT_DIR = DATA_ROOT / "output"
+
+# Keyframe selection: fuse a frame only if its camera moved or
+# rotated at least this much since the last frame fused from it.
 USE_KEYFRAMES = True
 KEYFRAME_MIN_TRANSLATION = 0.10    # [m]
 KEYFRAME_MIN_ROTATION_DEG = 5.0    # [deg]
 
-def load_frame(rgb_path, depth_path):
-    """
-    Load RGB and depth exactly as Spot saved them (NATIVE raster).
+MAX_POSE_DT = 1.0                  # [s] pairing tolerance
 
-    No rotation here -- see the IMAGE ORIENTATION note at the top of
-    this file. Image size vs calibration and RGB/depth alignment are
-    checked inside PointCloudBuilder.build().
-    """
+# Plots: resolution of the saved PNGs, whether to also open them
+# (Matplotlib windows + Plotly in the browser), and the cell budget of
+# the Matplotlib 3D scatter (it gets slow and muddy beyond that).
+FIGURE_DPI = 200
+SHOW_PLOTS = True
+PLOT_3D_MAX_POINTS = 150000
+
+
+# -----------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------
+
+def load_frame(rgb_path, depth_path):
+    """Load RGB and depth exactly as Spot saved them (NATIVE raster)."""
 
     rgb = np.array(Image.open(rgb_path).convert("RGB"))
     depth = np.array(Image.open(depth_path))
@@ -113,11 +117,7 @@ def load_frame(rgb_path, depth_path):
 
 
 def get_field(pc, key):
-    """
-    Fetch a key from PointCloudBuilder.build()'s output with a clear
-    error message if the key doesn't exist, instead of a bare
-    KeyError -- the exact key names are assumed, not confirmed.
-    """
+    """PointCloudBuilder.build() output field, with a clear error."""
 
     if key not in pc:
         raise KeyError(
@@ -126,18 +126,6 @@ def get_field(pc, key):
         )
 
     return pc[key]
-
-
-def make_unweighted_config(config):
-    """
-    Return a shallow copy of the grid map config with noise_alpha
-    forced to 0, i.e. every point weight 1 (the old plain mean).
-    """
-
-    unweighted = copy.copy(config)
-    setattr(unweighted, "noise_alpha", 0.0)
-
-    return unweighted
 
 
 def rotation_angle_deg(R_a, R_b):
@@ -151,15 +139,9 @@ def rotation_angle_deg(R_a, R_b):
 def is_keyframe(R, t, last_R, last_t):
     """
     Whether a frame with pose (R, t) should be fused, given the pose
-    of the last fused frame (None for the first frame).
+    of the last fused frame of the same camera (None if none yet).
 
-    Returns
-    -------
-    keep : bool
-    moved : float
-        Translation [m] since the last fused frame (0 if first).
-    rotated : float
-        Rotation [deg] since the last fused frame (0 if first).
+    Returns (keep, moved [m], rotated [deg]).
     """
 
     if last_t is None:
@@ -188,260 +170,186 @@ def finite_percentiles(values, q):
     return np.percentile(values, q)
 
 
-def plot_layer(ax, grid_map, layer, bounds, title, cbar_label,
-               cmap="viridis", symmetric=False):
+def section(title):
+    print("\n" + "-" * 60)
+    print(title)
+    print("-" * 60)
+
+
+# -----------------------------------------------------------------
+# Pipeline steps
+# -----------------------------------------------------------------
+
+def pair_all_cameras(camera_calibration):
     """
-    Top-down heatmap of a (H, W) layer, cropped to the observed
-    bounding box, in world coordinates. NaN cells are left blank.
-    Rows map to world y and columns to world x, as in
-    GridMap.compute_cell_indices().
+    One FramePosePairer per camera; returns (paired_by_camera,
+    paired_frames) with paired_frames merged chronologically and
+    tagged with their camera_name.
     """
 
-    row_min, row_max, col_min, col_max = bounds
-    crop = layer[row_min:row_max + 1, col_min:col_max + 1]
+    paired_by_camera = {}
 
-    x0, y0 = grid_map.cell_to_world(row_min, col_min)
-    x1, y1 = grid_map.cell_to_world(row_max, col_max)
-    h = grid_map.resolution / 2
+    for camera_name in CAMERA_NAMES:
+        pairer = FramePosePairer(
+            rgb_dir=DATA_ROOT / "images_rgb" / camera_name,
+            depth_dir=DATA_ROOT / "depth_data" / camera_name,
+            pose_csv_path=DATA_ROOT / "odometry" / "odometry_log.csv",
+            max_pose_dt=MAX_POSE_DT,
+            camera_calibration=camera_calibration,
+            camera_name=camera_name
+        )
 
-    kwargs = {}
+        frames = pairer.pair()
 
-    if symmetric:
-        vmax = finite_percentiles(np.abs(crop), 99)
-        vmax = float(vmax) if vmax is not None and vmax > 0 else 1.0
-        kwargs = {"vmin": -vmax, "vmax": vmax}
+        if not frames:
+            print(f"WARNING: no frames paired for '{camera_name}', skipping it.")
+            continue
 
-    im = ax.imshow(
-        np.ma.masked_invalid(crop),
-        origin="lower",
-        extent=[x0 - h, x1 + h, y0 - h, y1 + h],
-        cmap=cmap,
-        interpolation="nearest",
-        **kwargs
-    )
+        for frame in frames:
+            frame["camera_name"] = camera_name
 
-    ax.set_title(title)
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_aspect("equal")
-    plt.colorbar(im, ax=ax, label=cbar_label, shrink=0.8)
+        paired_by_camera[camera_name] = frames
 
-
-if __name__ == "__main__":
-
-    # -------------------------------------------------------------
-    # Configuration
-    # -------------------------------------------------------------
-
-    perception_config = PerceptionConfig(
-        PROJECT_ROOT / "config" / "perception_config.yaml"
-    )
-
-    grid_map_config = GridMapConfig(
-        PROJECT_ROOT / "config" / "grid_map_config.yaml"
-    )
-
-    camera_calibration = CameraCalibrationConfig(
-        PROJECT_ROOT / "config" / "camera_intrinsics.yaml"
-    )
-
-    # Which camera this dataset's testset/images + testset/depths
-    # came from -- change this if you test a different camera.
-    camera_name = "frontleft"
-
-    # -------------------------------------------------------------
-    # Pair real frames with real poses (true camera pose)
-    # -------------------------------------------------------------
-
-    pairer = FramePosePairer(
-        rgb_dir=PROJECT_ROOT / "testset" / "images",
-        depth_dir=PROJECT_ROOT / "testset" / "depths",
-        pose_csv_path=PROJECT_ROOT / "testset" / "pose" / "odometry_log.csv",
-        max_pose_dt=1.0,
-        camera_calibration=camera_calibration,
-        camera_name=camera_name
-    )
-
-    paired_frames = pairer.pair()
-
-    if not paired_frames:
+    if not paired_by_camera:
         sys.exit("No frames could be paired with a pose -- nothing to fuse.")
 
-    # -------------------------------------------------------------
-    # Build the pipeline
-    # -------------------------------------------------------------
+    # Chronological across cameras, so origin and height datum anchor
+    # on the earliest frame of the run. Ties (same shot) broken by
+    # CAMERA_NAMES order, i.e. front cameras first: they see more
+    # ground ahead, which steadies the datum estimate.
+    order = {name: i for i, name in enumerate(CAMERA_NAMES)}
 
-    builder = PointCloudBuilder(perception_config, camera_calibration)
-    class_reducer = ClassReducer(perception_config)
-    grid_map = GridMap(grid_map_config, class_reducer)
-
-    print("\n" + "-" * 60)
-    print("Noise model")
-    print("-" * 60)
-    print(
-        f"sigma^2 = {grid_map.noise_sigma0}^2 + "
-        f"{grid_map.noise_alpha} * z^{grid_map.noise_exponent}, "
-        f"z_ref = {grid_map.noise_reference_distance} m "
-        "(z = depth along the optical axis)"
+    paired_frames = sorted(
+        (frame for frames in paired_by_camera.values() for frame in frames),
+        key=lambda f: (f["timestamp"], order[f["camera_name"]])
     )
 
-    if grid_map.noise_alpha == 0:
-        print(
-            "noise_alpha = 0: every point has weight 1 (plain mean). "
-            "Set noise.alpha in grid_map_config.yaml to enable the "
-            "depth weighting."
-        )
+    print("\nPaired frames per camera:")
 
-    grid_map_unweighted = None
+    for camera_name, frames in paired_by_camera.items():
+        print(f"  {camera_name:<12} {len(frames)}")
 
-    if COMPARE_WITH_UNWEIGHTED:
-        if grid_map.noise_alpha == 0:
-            print(
-                "A/B comparison skipped: the main map is already "
-                "unweighted."
-            )
-        else:
-            grid_map_unweighted = GridMap(
-                make_unweighted_config(grid_map_config), class_reducer
-            )
+    return paired_by_camera, paired_frames
 
-            # If GridMap reads alpha from a nested 'noise' section
-            # instead of config.noise_alpha, the setattr above does
-            # nothing and the A/B would silently compare two
-            # identical maps.
-            if grid_map_unweighted.noise_alpha != 0:
-                raise RuntimeError(
-                    "make_unweighted_config() did not reach GridMap: "
-                    f"unweighted map still has noise_alpha = "
-                    f"{grid_map_unweighted.noise_alpha}. Check where "
-                    "GridMap reads noise_alpha from the config."
-                )
 
-    if USE_KEYFRAMES:
-        print(
-            f"Keyframes: fuse only after >= {KEYFRAME_MIN_TRANSLATION} m "
-            f"or >= {KEYFRAME_MIN_ROTATION_DEG} deg since the last "
-            "fused frame."
-        )
-    else:
-        print("Keyframes: disabled, every paired frame is fused.")
+def sanity_check(paired_by_camera, builder, grid_map):
+    """
+    Point cloud statistics on the first frame of EACH camera. A camera
+    with a wrong orientation/extrinsic shows up as world z off from
+    the others (far above the camera, or growing with depth).
+    """
 
-    print("-" * 60)
+    for camera_name, frames in paired_by_camera.items():
+        first = frames[0]
+        rgb, depth = load_frame(first["rgb_path"], first["depth_path"])
+        pts_cam = get_field(builder.build(rgb, depth, camera_name), "points_xyz")
 
-    # -------------------------------------------------------------
-    # Sanity check on the first frame, before fusing everything
-    # -------------------------------------------------------------
+        section(f"Sanity check ({camera_name}, first frame)")
 
-    first = paired_frames[0]
-    rgb, depth = load_frame(first["rgb_path"], first["depth_path"])
-    pc = builder.build(rgb, depth, camera_name)
+        if pts_cam.shape[0] == 0:
+            print("No valid points in this frame.")
+            continue
 
-    pts_cam = get_field(pc, "points_xyz")
-
-    if pts_cam.shape[0] > 0:
         pts_world = pts_cam @ first["R"].T + first["t"]
-        distances = np.linalg.norm(pts_cam, axis=1)
-        weights = grid_map.compute_point_weights(pts_cam)
 
-        print("\n" + "-" * 60)
-        print("Sanity check (first frame)")
-        print("-" * 60)
         print("Camera position (world):", first["t"])
-        print(
-            "Depth z [m] p1/p50/p99:",
-            np.percentile(pts_cam[:, 2], [1, 50, 99])
-        )
-        print(
-            "3D distance [m] p1/p50/p99 (info only):",
-            np.percentile(distances, [1, 50, 99])
-        )
-        print(
-            "Point weight p1/p50/p99:",
-            np.percentile(weights, [1, 50, 99])
-        )
-        print(
-            "World z [m] p1/p50/p99:",
-            np.percentile(pts_world[:, 2], [1, 50, 99])
-        )
-        print(
-            "Expected: world z mostly at or below the camera height, "
-            "no values growing with depth; depth z within the 4 m "
-            "cutoff (3D distance may exceed it off-axis); weights "
-            "decreasing with depth (all 1 if noise_alpha = 0)."
-        )
-        print("-" * 60)
+        print("Depth z [m] p1/p50/p99:",
+              np.percentile(pts_cam[:, 2], [1, 50, 99]))
+        print("Point weight p1/p50/p99:",
+              np.percentile(grid_map.compute_point_weights(pts_cam), [1, 50, 99]))
+        print("World z [m] p1/p50/p99:",
+              np.percentile(pts_world[:, 2], [1, 50, 99]))
+
+    print(
+        "\nExpected for every camera: world z mostly at or below the "
+        "camera height and consistent ACROSS cameras (same ground), "
+        "depth z within the 4 m cutoff, weights decreasing with depth."
+    )
+
+
+def fuse(paired_frames, builder, grid_map):
+    """
+    Fuse every keyframe into grid_map (keyframe state kept per
+    camera). Returns the per-frame trajectory records.
+    """
+
+    cameras = {f["camera_name"] for f in paired_frames}
+    last_pose = {name: (None, None) for name in cameras}
+    fused_count = {name: 0 for name in cameras}
+    skipped_count = {name: 0 for name in cameras}
+
+    trajectory = []
 
     print(f"\nProcessing {len(paired_frames)} paired frame(s)...\n")
 
-    # -------------------------------------------------------------
-    # Fuse every keyframe
-    # -------------------------------------------------------------
-
-    last_R, last_t = None, None
-    n_fused, n_skipped = 0, 0
-
     for frame in paired_frames:
-        R = frame["R"]
-        t = frame["t"]
+        camera_name = frame["camera_name"]
+        R, t = frame["R"], frame["t"]
+
+        keep = True
 
         if USE_KEYFRAMES:
+            last_R, last_t = last_pose[camera_name]
             keep, moved, rotated = is_keyframe(R, t, last_R, last_t)
 
-            if not keep:
-                n_skipped += 1
-                print(
-                    f"{frame['rgb_path'].name}: SKIPPED (static: "
-                    f"moved {moved * 100:.1f} cm, rotated "
-                    f"{rotated:.1f} deg)"
-                )
-                continue
+        trajectory.append({
+            "timestamp": frame["timestamp"],
+            "camera_name": camera_name,
+            "R": R,
+            "t": t,
+            "fused": keep,
+        })
+
+        if not keep:
+            skipped_count[camera_name] += 1
+            print(
+                f"{frame['rgb_path'].name}: SKIPPED (static: moved "
+                f"{moved * 100:.1f} cm, rotated {rotated:.1f} deg)"
+            )
+            continue
 
         rgb, depth = load_frame(frame["rgb_path"], frame["depth_path"])
-
         pc = builder.build(rgb, depth, camera_name)
 
-        points_xyz = get_field(pc, "points_xyz").astype(
-            np.float32, copy=False
-        )
-
-        semantic_colors = get_field(pc, "semantic_colors").astype(
-            np.uint8, copy=False
-        )
-
-        semantic_probs = get_field(pc, "semantic_probs").astype(
-            np.float32, copy=False
-        )
+        points_xyz = get_field(pc, "points_xyz").astype(np.float32, copy=False)
+        semantic_colors = get_field(pc, "semantic_colors").astype(np.uint8, copy=False)
+        semantic_probs = get_field(pc, "semantic_probs").astype(np.float32, copy=False)
 
         grid_map.update(points_xyz, semantic_colors, semantic_probs, R, t)
 
-        if grid_map_unweighted is not None:
-            grid_map_unweighted.update(
-                points_xyz, semantic_colors, semantic_probs, R, t
-            )
-
-        last_R, last_t = R, t
-        n_fused += 1
+        last_pose[camera_name] = (R, t)
+        fused_count[camera_name] += 1
 
         print(
-            f"{frame['rgb_path'].name}: "
-            f"{points_xyz.shape[0]} points, pose t={t}, "
-            f"pose_dt={frame['pose_dt']:.3f}s"
+            f"{frame['rgb_path'].name}: {points_xyz.shape[0]} points, "
+            f"pose t={t}, pose_dt={frame['pose_dt']:.3f}s"
+        )
+
+    print("\nFused / skipped per camera:")
+
+    for camera_name in [c for c in CAMERA_NAMES if c in cameras]:
+        print(
+            f"  {camera_name:<12} fused {fused_count[camera_name]:>4}, "
+            f"skipped {skipped_count[camera_name]:>4}"
         )
 
     print(
-        f"\nFused {n_fused} frame(s), skipped {n_skipped} "
-        f"(out of {len(paired_frames)}).\n"
+        f"Total: fused {sum(fused_count.values())}, "
+        f"skipped {sum(skipped_count.values())} "
+        f"(out of {len(paired_frames)})."
     )
 
-    # -------------------------------------------------------------
-    # Diagnostics
-    # -------------------------------------------------------------
+    return trajectory
+
+
+def print_summary(grid_map):
+    """Text summary of the fused map."""
+
+    section("Map summary")
 
     elevation = grid_map.get_elevation_layer()
     count = grid_map.get_count_layer()
-    weight = grid_map.get_weight_layer()
-    elevation_std = np.sqrt(grid_map.get_elevation_variance_layer())
-    roughness_std = np.sqrt(grid_map.get_roughness_layer())
+    observed = count > 0
 
     print("Grid shape:", elevation.shape)
     print("Origin:", grid_map.get_origin())
@@ -451,167 +359,187 @@ if __name__ == "__main__":
     if datum is None:
         print("Height datum: none (elevation in raw odom heights)")
     else:
-        print(
-            f"Height datum: {datum:+.3f} m odom z -> elevation 0 = "
-            "ground under the starting pose"
-        )
-    print(
-        "Observed cells:",
-        np.isfinite(elevation).sum(), "/", elevation.size
+        print(f"Height datum: {datum:+.3f} m odom z "
+              "(elevation 0 = ground under the starting pose)")
+
+    print("Observed cells:", int(observed.sum()), "/", elevation.size)
+
+    if not np.any(observed):
+        print("No observed cells.")
+        return
+
+    print("Max observations in a single cell:", float(count.max()))
+    print("Elevation [m] min/max:", np.nanmin(elevation), np.nanmax(elevation))
+    print("Weight per cell p5/p50/p95:",
+          np.percentile(grid_map.get_weight_layer()[observed], [5, 50, 95]))
+
+    std_pct = finite_percentiles(
+        np.sqrt(grid_map.get_elevation_variance_layer()), [5, 50, 95]
     )
-    print("Max observations in a single cell:", np.nanmax(count))
-    print(
-        "Elevation [m] min/max:",
-        np.nanmin(elevation), np.nanmax(elevation)
-    )
-
-    observed = count > 0
-
-    if np.any(observed):
-        print(
-            "Weight per cell p5/p50/p95:",
-            np.percentile(weight[observed], [5, 50, 95])
-        )
-
-    std_pct = finite_percentiles(elevation_std, [5, 50, 95])
 
     if std_pct is not None:
-        print(
-            "Posterior elevation std [cm] p5/p50/p95:",
-            std_pct * 100,
-            "(optimistic: relative confidence only)"
-        )
+        print("Posterior elevation std [cm] p5/p50/p95:", std_pct * 100,
+              "(optimistic: relative confidence only)")
 
-    rough_pct = finite_percentiles(roughness_std, [5, 50, 95])
+    rough_pct = finite_percentiles(
+        np.sqrt(grid_map.get_roughness_layer()), [5, 50, 95]
+    )
 
     if rough_pct is not None:
-        print(
-            "Roughness (height spread in cell) std [cm] p5/p50/p95:",
-            rough_pct * 100
+        print("Roughness std [cm] p5/p50/p95:", rough_pct * 100)
+
+    row_min, row_max, col_min, col_max = grid_map.get_observed_bounds()
+    x_min, y_min = grid_map.cell_to_world(row_min, col_min)
+    x_max, y_max = grid_map.cell_to_world(row_max, col_max)
+    half = grid_map.grid_map_config.map_length / 2
+
+    print(f"Observed footprint: x=[{x_min:.2f}, {x_max:.2f}] m, "
+          f"y=[{y_min:.2f}, {y_max:.2f}] m (grid half-extent: {half} m)")
+
+
+def save_outputs(grid_map, trajectory, grid_map_config, class_reducer):
+    """
+    Save the map and the trajectory, then reload the map into a fresh
+    GridMap and check every layer matches, so the file is known to
+    be usable by the visualization script.
+    """
+
+    section("Saving")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    map_path = OUTPUT_DIR / "grid_map.npz"
+    trajectory_path = OUTPUT_DIR / "trajectory.npz"
+
+    grid_map.save(map_path)
+
+    np.savez_compressed(
+        trajectory_path,
+        timestamp=np.array([r["timestamp"] for r in trajectory], dtype=np.float64),
+        camera_name=np.array([r["camera_name"] for r in trajectory]),
+        R=np.stack([np.asarray(r["R"], dtype=np.float64) for r in trajectory]),
+        t=np.stack([np.asarray(r["t"], dtype=np.float64) for r in trajectory]),
+        fused=np.array([r["fused"] for r in trajectory], dtype=bool),
+    )
+
+    print(f"Trajectory saved to {trajectory_path} ({len(trajectory)} frame(s)).")
+
+    # Round-trip check.
+    reloaded = GridMap(grid_map_config, class_reducer)
+    reloaded.load(map_path)
+
+    layers = {
+        "elevation": GridMap.get_elevation_layer,
+        "elevation_variance": GridMap.get_elevation_variance_layer,
+        "roughness": GridMap.get_roughness_layer,
+        "rgb": GridMap.get_rgb_layer,
+        "semantic_probs": GridMap.get_semantic_probs_layer,
+        "count": GridMap.get_count_layer,
+    }
+
+    mismatched = [
+        name for name, getter in layers.items()
+        if not np.allclose(getter(grid_map), getter(reloaded), equal_nan=True)
+    ]
+
+    if reloaded.get_height_datum() != grid_map.get_height_datum():
+        mismatched.append("height_datum")
+
+    if mismatched:
+        raise RuntimeError(
+            f"Reloaded map differs from the fused one in: {mismatched}"
         )
 
-    bounds = grid_map.get_observed_bounds()
+    print("Round-trip check OK: reloaded map matches the fused one.")
 
-    if bounds is not None:
-        row_min, row_max, col_min, col_max = bounds
 
-        x_min, y_min = grid_map.cell_to_world(row_min, col_min)
-        x_max, y_max = grid_map.cell_to_world(row_max, col_max)
+def plot_outputs(grid_map):
+    """
+    Plot the fused map and save every figure in OUTPUT_DIR: elevation,
+    top-down semantics, Matplotlib 3D and Plotly 3D (HTML).
+    """
 
-        print(
-            f"Observed footprint: x=[{x_min:.2f}, {x_max:.2f}] m, "
-            f"y=[{y_min:.2f}, {y_max:.2f}] m "
-            f"(grid half-extent: {grid_map.grid_map_config.map_length / 2} m)"
-        )
+    section("Plots")
 
-    # -------------------------------------------------------------
-    # A/B comparison: weighted vs unweighted
-    # -------------------------------------------------------------
-
-    elevation_diff = None
-
-    if grid_map_unweighted is not None:
-        elevation_unweighted = grid_map_unweighted.get_elevation_layer()
-        elevation_diff = elevation - elevation_unweighted
-
-        abs_diff = np.abs(elevation_diff[np.isfinite(elevation_diff)])
-
-        print("\n" + "-" * 60)
-        print("A/B: weighted (current noise model) vs unweighted (alpha = 0)")
-        print("-" * 60)
-
-        if abs_diff.size > 0:
-            print(
-                "|elevation diff| [cm] p50/p95/max:",
-                np.percentile(abs_diff, 50) * 100,
-                np.percentile(abs_diff, 95) * 100,
-                abs_diff.max() * 100
-            )
-            print(
-                f"Cells changed by more than "
-                f"{AB_DIFF_THRESHOLD * 100:.0f} cm: "
-                f"{np.count_nonzero(abs_diff > AB_DIFF_THRESHOLD)} / "
-                f"{abs_diff.size} "
-                f"({100 * np.mean(abs_diff > AB_DIFF_THRESHOLD):.1f}%)"
-            )
-
-        probs_w = grid_map.get_semantic_probs_layer()[observed]
-        probs_u = grid_map_unweighted.get_semantic_probs_layer()[observed]
-
-        if probs_w.size > 0:
-            changed_labels = np.count_nonzero(
-                probs_w.argmax(axis=-1) != probs_u.argmax(axis=-1)
-            )
-
-            print(
-                "Cells whose most likely class changed: "
-                f"{changed_labels} / {probs_w.shape[0]} "
-                f"({100 * changed_labels / probs_w.shape[0]:.1f}%)"
-            )
-
-        print(
-            "Small differences mean point density was already "
-            "favoring near observations; large ones concentrate "
-            "where cells were seen both from far and from close."
-        )
-        print("-" * 60)
-
-    # -------------------------------------------------------------
-    # Visualize: 2D elevation heatmap + 3D semantic scatter
-    # -------------------------------------------------------------
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     visualizer = GridMapVisualizer(grid_map)
+    figures = {}
 
-    fig = plt.figure(figsize=(13, 6))
+    fig, _ = visualizer.plot_elevation_heatmap()
+    figures["elevation.png"] = fig
 
-    ax1 = fig.add_subplot(1, 2, 1)
-    visualizer.plot_elevation_heatmap(ax=ax1)
+    fig, _ = visualizer.plot_semantic_topdown()
+    figures["semantic_topdown.png"] = fig
 
-    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-    visualizer.plot_semantic_3d(ax=ax2)
+    fig, _ = visualizer.plot_semantic_3d(max_points=PLOT_3D_MAX_POINTS)
+    figures["semantic_3d.png"] = fig
 
-    # Equal-ish scale on the 3D axes, so z isn't visually stretched.
-    xs = np.array(ax2.get_xlim3d())
-    ys = np.array(ax2.get_ylim3d())
-    zs = np.array(ax2.get_zlim3d())
-    ax2.set_box_aspect((np.ptp(xs), np.ptp(ys), np.ptp(zs)))
+    # Save before show(): closing the windows discards the figures.
+    for filename, fig in figures.items():
+        path = OUTPUT_DIR / filename
+        fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+        print(f"Saved {path}")
 
-    plt.tight_layout()
-    plt.show()
+    fig_plotly = visualizer.plot_semantic_3d_plotly()
+    html_path = OUTPUT_DIR / "semantic_3d.html"
+    fig_plotly.write_html(html_path)
+    print(f"Saved {html_path}")
 
-    # -------------------------------------------------------------
-    # Visualize: uncertainty, roughness and A/B difference
-    # -------------------------------------------------------------
-
-    if bounds is not None:
-        n_panels = 3 if elevation_diff is not None else 2
-
-        fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5.5))
-
-        plot_layer(
-            axes[0], grid_map, elevation_std * 100, bounds,
-            "Posterior elevation std", "std [cm]"
-        )
-
-        plot_layer(
-            axes[1], grid_map, roughness_std * 100, bounds,
-            "Roughness (height spread in cell)", "std [cm]",
-            cmap="magma"
-        )
-
-        if elevation_diff is not None:
-            plot_layer(
-                axes[2], grid_map, elevation_diff * 100, bounds,
-                "Elevation: weighted - unweighted", "diff [cm]",
-                cmap="RdBu_r", symmetric=True
-            )
-
-        plt.tight_layout()
+    if SHOW_PLOTS:
+        fig_plotly.show()
         plt.show()
+    else:
+        plt.close("all")
 
-    fig, ax = visualizer.plot_semantic_topdown()
-    plt.show()
 
-    fig3d = visualizer.plot_semantic_3d_plotly()
-    fig3d.write_html(PROJECT_ROOT / "grid_map_semantic_3d.html")
-    fig3d.show()
+# -----------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------
+
+def main():
+    perception_config = PerceptionConfig(
+        PROJECT_ROOT / "config" / "perception_config.yaml"
+    )
+    grid_map_config = GridMapConfig(
+        PROJECT_ROOT / "config" / "grid_map_config.yaml"
+    )
+    camera_calibration = CameraCalibrationConfig(
+        PROJECT_ROOT / "config" / "camera_intrinsics.yaml"
+    )
+
+    paired_by_camera, paired_frames = pair_all_cameras(camera_calibration)
+
+    builder = PointCloudBuilder(perception_config, camera_calibration)
+    class_reducer = ClassReducer(perception_config)
+    grid_map = GridMap(grid_map_config, class_reducer)
+
+    section("Settings")
+    print(
+        f"Noise model: sigma^2 = {grid_map.noise_sigma0}^2 + "
+        f"{grid_map.noise_alpha} * z^{grid_map.noise_exponent} "
+        f"(z_ref = {grid_map.noise_reference_distance} m)"
+    )
+    print(f"Height datum mode: {grid_map.height_datum_mode}")
+
+    if USE_KEYFRAMES:
+        print(
+            f"Keyframes (per camera): >= {KEYFRAME_MIN_TRANSLATION} m "
+            f"or >= {KEYFRAME_MIN_ROTATION_DEG} deg"
+        )
+    else:
+        print("Keyframes: disabled, every paired frame is fused.")
+
+    sanity_check(paired_by_camera, builder, grid_map)
+
+    trajectory = fuse(paired_frames, builder, grid_map)
+
+    print_summary(grid_map)
+
+    save_outputs(grid_map, trajectory, grid_map_config, class_reducer)
+
+    plot_outputs(grid_map)
+
+
+if __name__ == "__main__":
+    main()
