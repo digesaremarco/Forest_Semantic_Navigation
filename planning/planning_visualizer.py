@@ -90,10 +90,12 @@ class PlanningVisualizer:
             cost_layer, kind="total", ax=ax
         )
 
+        # Highest zorder of the plot: the robot stays visible on top
+        # of the path, the waypoints and the selected frontier.
         ax.scatter(
             [robot_position_world[0]], [robot_position_world[1]],
-            c="cyan", s=120, marker="*", edgecolors="black",
-            label="robot", zorder=5
+            c="cyan", s=480, marker="*", edgecolors="black",
+            label="robot", zorder=7
         )
 
         for cluster in detection["clusters"]:
