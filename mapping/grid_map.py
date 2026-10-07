@@ -21,17 +21,13 @@ Pipeline:
     rgb / semantic_probs / count
     (one static grid, aligned layers)
 
-Design choices (see conversation history for the reasoning):
+Design choices:
 
 - The grid is STATIC and world-axis-aligned, not robot-centric.
   There is no rolling/shifting buffer: at the very first update()
   call, the received position anchors the grid's center cell once
   and for the whole session. The robot moves through the grid, the
-  grid itself never moves. This is deliberately simpler than
-  elevation_mapping_cupy's rolling buffer, and is the right choice
-  at this scale (a fixed ~20x20 m field-test area), where the
-  memory savings of a rolling buffer are not needed.
-
+  grid itself never moves.
 - Per-point measurement noise depends on the DEPTH z of the point
   along the camera optical axis (points_xyz[:, 2], since points_xyz
   is in the camera optical frame):
@@ -40,8 +36,7 @@ Design choices (see conversation history for the reasoning):
 
   Stereo depth error comes from disparity error, so it is a function
   of z, not of the 3D Euclidean distance. With Spot's wide-FOV
-  cameras the two differ a lot off-axis (on the test set: p99 depth
-  3.7 m vs p99 distance 4.6 m). Using z also keeps the model
+  cameras the two differ a lot off-axis. Using z also keeps the model
   consistent with the point cloud pre-filter, which cuts on z at
   4 m.
 
