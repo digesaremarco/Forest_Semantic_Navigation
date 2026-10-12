@@ -1,0 +1,71 @@
+# Navigation configuration.
+#
+# Read by navigation/navigation_config_loader.py (NavigationConfig),
+# used by navigation/waypoint_follower.py (WaypointFollower): follows
+# the waypoints of PlanningPipeline.plan() / plan_to_goal() with Spot's
+# own trajectory controller, one waypoint at a time, in the vision
+# frame.
+
+mobility:
+  # Velocity limits sent with every command. Spot's defaults are much
+  # faster; in the forest a slow, careful gait gives better footing
+  # and keeps the robot's obstacle avoidance effective.
+  max_linear_velocity_mps: 0.5
+  max_lateral_velocity_mps: 0.3
+  max_angular_velocity_rps: 0.6
+
+  # Gait: auto | trot | speed_select_trot | crawl | speed_select_crawl
+  #       | amble | speed_select_amble | jog | hop
+  # auto lets Spot pick; crawl is the slowest and most stable.
+  locomotion_hint: auto
+
+  # Body height relative to the nominal stand height [m].
+  body_height_m: 0.0
+
+  # Spot's own vision-based obstacle avoidance, kept on as a safety
+  # layer on top of the planner's costmap. Tall grass or bushes may
+  # make Spot refuse to advance: those cases come back as "blocked".
+  obstacle_avoidance_enabled: true
+
+  # Extra clearance Spot keeps from obstacles it detects [m].
+  obstacle_avoidance_padding_m: 0.1
+
+  # Ground friction hint (e.g. 0.4 for wet leaves / mud). null lets
+  # the robot estimate it.
+  ground_mu_hint: null
+
+waypoint_following:
+  # Intermediate waypoints: as soon as the robot is within this
+  # distance, the next waypoint is commanded without stopping, so the
+  # motion stays continuous. Must be smaller than the waypoint spacing
+  # (planning_config.yaml: waypoint_spacing_m).
+  pass_through_radius_m: 0.3
+
+  # Final waypoint: reached when Spot reports the trajectory stopped
+  # and the body is within this distance of it.
+  goal_tolerance_m: 0.2
+
+  # Final heading: logged, and a warning is printed above this error.
+  goal_heading_tolerance_deg: 20.0
+
+  # How often feedback and robot state are polled [s].
+  feedback_period_s: 0.1
+
+failure_detection:
+  # Per-waypoint time budget:
+  #   base_timeout_s + distance_to_waypoint / nominal_speed_mps
+  base_timeout_s: 10.0
+  nominal_speed_mps: 0.25
+
+  # Stalled: the distance to the current waypoint did not decrease by
+  # at least min_progress_m within stall_window_s (Spot stuck, slipping
+  # or walking in place).
+  stall_window_s: 8.0
+  min_progress_m: 0.1
+
+  # Blocked: Spot reports the goal as blocked (its obstacle avoidance
+  # cannot find a way) continuously for this long.
+  blocked_patience_s: 3.0
+
+  # Hard cap on one whole follow() call [s].
+  max_path_duration_s: 300.0
