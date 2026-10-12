@@ -1,0 +1,56 @@
+# Acquisition configuration.
+#
+# One synchronized get_image() call per stop, for the visual (RGB) and
+# depth_in_visual_frame sources of every camera listed below. Read by
+# acquisition/acquisition_config_loader.py (AcquisitionConfig), used by
+# acquisition/image_acquirer.py (ImageAcquirer) and
+# acquisition/observation_logger.py (ObservationLogger).
+
+# Cameras acquired at every stop. Each must also be loaded by
+# CameraCalibrationConfig (fusion/camera_calibration_loader.py).
+# Source names follow Spot's convention:
+#   <camera>_fisheye_image, <camera>_depth_in_visual_frame
+cameras: [frontleft, frontright, left, right]
+
+image_request:
+  # JPEG quality of the visual (RGB) sources. Keep it equal to the one
+  # used to record the data the model was validated on
+  # (spot_rgb_depth_log.py: 90).
+  jpeg_quality: 90
+
+capture:
+  # Wait this long before capturing, so the body has stopped swaying
+  # after the last locomotion command (stop-and-go).
+  settle_time_s: 0.5
+
+  # Maximum allowed gap between the acquisition times of a camera's
+  # visual image and its depth_in_visual_frame image. The robot is
+  # static during capture, so this only catches stale frames.
+  max_visual_depth_dt_s: 0.2
+
+  # A failed capture (RPC error, missing source, inconsistent
+  # response) is retried this many times in total before giving up.
+  max_retries: 3
+  retry_delay_s: 0.5
+
+calibration_check:
+  # At startup, compare image size, pinhole intrinsics and
+  # body_tform_camera reported live by the robot with
+  # camera_intrinsics.yaml (used by PointCloudBuilder).
+  enabled: true
+
+  # warn  -> print the mismatch and continue.
+  # error -> raise, the pipeline does not start.
+  on_mismatch: warn
+
+  max_translation_error_m: 0.01
+  max_rotation_error_deg: 1.0
+  max_intrinsics_error_px: 1.0
+
+logging:
+  # Save every snapshot to disk (images, depth, odometry, poses).
+  save_to_disk: true
+
+  # Root folder of the runs; relative paths are resolved against the
+  # project root. Each run gets its own timestamped subfolder.
+  output_root: spot_runs
