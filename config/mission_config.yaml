@@ -1,0 +1,65 @@
+# Exploration mission configuration.
+#
+# Read by mission/mission_config_loader.py (MissionConfig), used by
+# mission/exploration_mission.py (ExplorationMission), the state
+# machine run by main.py:
+#
+#   INIT -> ACQUIRE -> MAP_UPDATE -> CHECK -> PLAN -> NAVIGATE -> ACQUIRE ...
+#                                      |        |
+#                                      v        v
+#                                 RETURN_HOME -> SHUTDOWN -> DONE
+
+stop_criteria:
+  # The FIRST criterion met ends the exploration; the robot then goes
+  # back to its start position (return_home).
+
+  # Explored fraction of the map: observed cells / cells of the grid
+  # minus the border excluded from frontier detection
+  # (planning_config.yaml: border_margin_cells). In a forest a large
+  # part is never observable (trunks, bushes): start low and tune it
+  # in the field.
+  coverage_threshold: 0.6
+
+  # Exploration time cap [s], from the first acquisition. The return
+  # home is NOT counted.
+  max_exploration_time_s: 1800.0
+
+  # Locomotion battery [%]. Leave margin for the return home.
+  min_battery_percent: 35.0
+
+  # Consecutive navigation failures (timeout / stalled / blocked).
+  # Each failed target is blacklisted; reaching this many in a row
+  # ends the exploration.
+  max_consecutive_nav_failures: 3
+
+  # Consecutive acquisition failures (get_image errors after retries).
+  max_consecutive_acquisition_failures: 3
+
+return_home:
+  enabled: true
+
+  # Each attempt re-acquires, updates the map and replans from where
+  # the robot is (an earlier attempt may have stopped halfway).
+  max_attempts: 3
+
+keyframes:
+  # A camera is fused only if it moved or turned at least this much
+  # since its last fused frame: a robot that failed to move and
+  # re-acquires from the same spot would otherwise fuse the same
+  # correlated stereo errors again (same rule as test_grid_map.py).
+  enabled: true
+  min_translation_m: 0.10
+  min_rotation_deg: 5.0
+
+output:
+  # Everything goes in one folder per mission, created under the
+  # acquisition output root (acquisition_config.yaml: logging.output_root).
+  run_prefix: mission
+
+  # Planning overlay (cost + frontiers + path) saved at every cycle,
+  # plots/cycle_NNN.png. About 1 s per cycle on the Jetson.
+  save_cycle_plots: false
+
+  # Save grid_map.npz after every cycle (crash safety), not only at the
+  # end. A few seconds per cycle.
+  save_map_every_cycle: false
