@@ -4,6 +4,8 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+SUPPORTED_BACKENDS = ("onnx", "tensorrt")
+
 
 class PerceptionConfig:
     """Loads and provides access to the perception configuration."""
@@ -35,13 +37,19 @@ class PerceptionConfig:
                 "Missing 'model' section in perception configuration."
             )
 
-        model_path = model_config.get("path")
-        self.num_classes = model_config.get("num_classes")
+        # Inference backend. Missing -> "onnx", the behavior before
+        # the field existed.
+        backend = model_config.get("backend", "onnx")
 
-        if model_path is None:
+        if not isinstance(backend, str) or backend.lower() not in SUPPORTED_BACKENDS:
             raise ValueError(
-                "Missing 'model.path' in perception configuration."
+                f"'model.backend' must be one of {SUPPORTED_BACKENDS}, "
+                f"got {backend!r}."
             )
+
+        self.backend = backend.lower()
+
+        self.num_classes = model_config.get("num_classes")
 
         if self.num_classes is None:
             raise ValueError(
@@ -55,16 +63,47 @@ class PerceptionConfig:
                 "Missing 'model.device' in perception configuration."
             )
 
-        model_path = Path(model_path)
+        if self.backend == "tensorrt" and not str(self.device).lower().startswith("cuda"):
+            raise ValueError(
+                "'model.backend' tensorrt needs a CUDA device, "
+                f"got model.device = {self.device!r}."
+            )
 
-        if not model_path.is_absolute():
-            model_path = PROJECT_ROOT / model_path
+        # Both paths are resolved when present; only the one used by
+        # the selected backend is required to exist (the Jetson may
+        # not have the ONNX, iris cannot use the engine).
+        self.model_path = self.resolve_path(model_config.get("path"))
+        self.engine_path = self.resolve_path(model_config.get("engine_path"))
 
-        self.model_path = model_path.resolve()
+        if self.backend == "onnx":
+            self.require_file(self.model_path, "model.path", "ONNX model")
+        else:
+            self.require_file(self.engine_path, "model.engine_path", "TensorRT engine")
 
-        if not self.model_path.exists():
+    @staticmethod
+    def resolve_path(path):
+        """Absolute Path (relative to the project root), or None."""
+
+        if path is None:
+            return None
+
+        path = Path(path)
+
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+
+        return path.resolve()
+
+    def require_file(self, path, parameter_name, description):
+        if path is None:
+            raise ValueError(
+                f"Missing '{parameter_name}' in perception configuration "
+                f"(required by backend '{self.backend}')."
+            )
+
+        if not path.exists():
             raise FileNotFoundError(
-                f"ONNX model not found: {self.model_path}"
+                f"{description} not found: {path}"
             )
 
     def load_classes(self):

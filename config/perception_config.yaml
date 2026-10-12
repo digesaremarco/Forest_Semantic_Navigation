@@ -1,5 +1,21 @@
 model:
+  # Inference backend:
+  #   "onnx"     -> ONNX Runtime on `path` (CUDA if available, else CPU).
+  #                 Use on iris / any x86 machine.
+  #   "tensorrt" -> serialized TensorRT engine `engine_path`, GPU only.
+  #                 Use on the Jetson (CORE I/O).
+  # A TensorRT engine only runs with the TensorRT version and the GPU it
+  # was built on: build it on the Jetson itself (trtexec), from the same
+  # ONNX as `path`.
+  backend: "tensorrt"
+
+  # ONNX model (backend: onnx).
   path: "models/segformer_b1_tversky.onnx"
+
+  # TensorRT engine (backend: tensorrt). Relative paths are resolved
+  # against the project root.
+  engine_path: "models/segformer_b1_tversky_fp16.engine"
+
   num_classes: 24
   device: "cuda0"
 
