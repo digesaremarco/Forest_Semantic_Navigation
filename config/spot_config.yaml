@@ -1,0 +1,32 @@
+# Spot connection, lease and power configuration.
+#
+# Read by spot/spot_config_loader.py (SpotConfig) and used by
+# spot/spot_interface.py (SpotInterface).
+
+connection:
+  robot_ip: # add ip address of the robot here
+  username: # add username of the robot here
+  password: # add password of the robot here
+
+  # Name this client registers with on the robot (shows up in the
+  # robot's logs and in the tablet's list of clients).
+  client_name: forest_semantic_navigation
+
+  # How long to wait for the time sync with the robot at connection.
+  time_sync_timeout_s: 10.0
+
+lease:
+  # take    -> take the body lease even if someone else (normally the
+  #            tablet) holds it: the usual operator hand-over.
+  # acquire -> fail if the lease is already held by anyone.
+  mode: take
+
+power:
+  power_on_timeout_s: 20.0
+  power_off_timeout_s: 20.0
+  stand_timeout_s: 10.0
+  sit_timeout_s: 10.0
+
+  # On SpotInterface.shutdown(): after sitting, also power the motors
+  # off. Only applies if this client holds the lease.
+  power_off_on_shutdown: true
