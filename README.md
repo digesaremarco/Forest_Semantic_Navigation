@@ -374,7 +374,7 @@ Unknown cells are crossable with the maximum penalty. Treating them as impassabl
 **Waypoints.** The smoothed polyline is resampled by arc length every $\Delta s = 0.5$ m. Waypoint $i$ gets the heading of the next segment:
 
 ```math
-\psi_i = \operatorname{atan2}(y_{i+1} - y_i,\; x_{i+1} - x_i)
+\psi_i = \mathrm{atan2}(y_{i+1} - y_i,\; x_{i+1} - x_i)
 ```
 
 As a result, Spot walks facing forward and stops at the frontier facing the unexplored area.
@@ -498,66 +498,6 @@ An autonomous exploration in a wooded area, covering about 25 × 22 m. The three
 
 ---
 
-## Repository structure
-
-```
-Forest_Semantic_Navigation/
-├── main.py                       # mission entry point (runs on the CORE I/O)
-├── config/                       # one YAML per module (see Section 8)
-├── spot/                         # SDK wrapper
-│   ├── spot_interface.py         #   connection, lease, power, stance, state, shutdown
-│   ├── spot_config_loader.py
-│   └── frame_utils.py            #   SE3 ↔ (R, t), yaw, quaternions
-├── acquisition/
-│   ├── image_acquirer.py         #   synchronized capture, decoding, poses, calibration check
-│   ├── observation_logger.py     #   raw snapshots to disk (replayable offline)
-│   ├── acquisition_snapshot.py   #   data contracts
-│   └── acquisition_config_loader.py
-├── perception/
-│   ├── segformer_inference.py    #   ONNX Runtime / TensorRT backends
-│   ├── tensorrt_runner.py        #   engine loading, GPU buffers (torch / pycuda / cuda-python)
-│   ├── class_reducer.py          #   24 → 16 classes
-│   └── perception_config_loader.py
-├── fusion/
-│   ├── pointcloud_builder.py     #   semantic point cloud
-│   ├── camera_calibration_loader.py
-│   └── frame_pose_pairing.py     #   offline image ↔ pose pairing
-├── mapping/
-│   ├── grid_map.py               #   static grid, Bayesian / Dirichlet fusion, height datum
-│   ├── grid_map_visualizer.py
-│   └── grid_map_config_loader.py
-├── costmap/
-│   ├── geometric_cost.py         #   slope, roughness, step
-│   ├── semantic_cost.py          #   expected per-class cost
-│   ├── cost_fusion.py
-│   └── costmap_config_loader.py
-├── planning/
-│   ├── frontier_detector.py  frontier_refiner.py  frontier_selector.py
-│   ├── path_planner.py           #   A*
-│   ├── obstacle_inflation.py     #   robot-footprint inflation
-│   ├── path_smoother.py  waypoint_generator.py
-│   ├── target_blacklist.py  replanning_trigger.py
-│   ├── planning_visualizer.py
-│   └── planning_config_loader.py
-├── pipeline/
-│   ├── traversability_pipeline.py
-│   └── planning_pipeline.py
-├── navigation/
-│   ├── waypoint_follower.py      #   10 Hz trajectory following, failure detection
-│   ├── nav_result.py
-│   └── navigation_config_loader.py
-├── mission/
-│   ├── exploration_mission.py    #   state machine
-│   ├── stop_criteria.py          #   stop criteria + coverage
-│   ├── mission_timer.py          #   experiment timing
-│   ├── mission_report.py         #   logs, CSVs, summary
-│   ├── mission_plotter.py        #   mission_path.png
-│   └── mission_config_loader.py
-├── test/                         # offline (simulated) and on-robot tests, analysis tools
-└── images/
-```
-
----
 
 ## Limitations and future work
 
