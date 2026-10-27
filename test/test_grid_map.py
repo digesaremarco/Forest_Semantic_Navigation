@@ -49,6 +49,23 @@ the last frame fused from that same camera. Static frames would repeat
 the same correlated stereo errors and inflate the cells' confidence.
 Skipped frames never reach PointCloudBuilder.
 
+EXISTING MAP: with REBUILD_MAP = False an already saved map is loaded
+instead of rebuilt -- no pairing, no SegFormer, no fusion: only the
+summary and the plots are redone (into OUTPUT_DIR). Looked up in
+order:
+    1. DATA_ROOT/grid_map.npz     the map saved by the mission (main.py),
+                                  fused live in the VISION frame,
+                                  including the captures on the move
+    2. OUTPUT_DIR/grid_map.npz    a map rebuilt earlier by this script
+                                  (ODOM frame), e.g. for a dataset
+                                  recorded with spot_rgb_depth_log.py
+If neither exists, or the one found cannot be loaded (e.g.
+grid_map_config.yaml or the retained classes changed since it was
+saved, so GridMap.load() refuses it), the map is rebuilt from the
+images and saved to OUTPUT_DIR. Set REBUILD_MAP = True to always
+rebuild, e.g. after changing the model, the noise model or the
+keyframe thresholds.
+
 IMAGE ORIENTATION: files are used exactly as Spot saved them (NATIVE
 raster). PointCloudBuilder turns only the RGB upright for SegFormer
 and maps the probabilities back. Do NOT feed files rotated for
@@ -82,10 +99,21 @@ CAMERA_NAMES = ["frontleft", "frontright", "left", "right"]
 
 # Dataset layout: <DATA_ROOT>/images_rgb/<camera>/, depth_data/<camera>/
 # and odometry/odometry_log.csv.
-DATA_ROOT = PROJECT_ROOT / "oggi2"
+DATA_ROOT = PROJECT_ROOT / "spot_runs" / "mission_20261027_091511"
 
 # Where grid_map.npz and trajectory.npz are written.
 OUTPUT_DIR = DATA_ROOT / "output"
+
+# False: load the mission's map (DATA_ROOT/grid_map.npz), or else a map
+# rebuilt earlier (OUTPUT_DIR/grid_map.npz); rebuild only if neither
+# exists. True: always rebuild from the images.
+REBUILD_MAP = False
+
+# Saved maps to reuse, in order of preference (see module docstring).
+EXISTING_MAP_PATHS = (
+    (DATA_ROOT / "grid_map.npz", "mission map, vision frame"),
+    (OUTPUT_DIR / "grid_map.npz", "map rebuilt by this script, odom frame"),
+)
 
 # Keyframe selection: fuse a frame only if its camera moved or
 # rotated at least this much since the last frame fused from it.
@@ -493,6 +521,40 @@ def plot_outputs(grid_map):
         plt.close("all")
 
 
+def load_existing_map(grid_map_config, class_reducer):
+    """
+    The first saved map of EXISTING_MAP_PATHS that exists and loads;
+    None if REBUILD_MAP is set or there is none (then it is rebuilt).
+    """
+
+    if REBUILD_MAP:
+        return None
+
+    section("Existing map")
+
+    for map_path, description in EXISTING_MAP_PATHS:
+        if not map_path.exists():
+            print(f"Not found: {map_path}")
+            continue
+
+        grid_map = GridMap(grid_map_config, class_reducer)
+
+        try:
+            grid_map.load(map_path)
+        except Exception as error:
+            print(f"Cannot load {map_path}: {error}")
+            continue
+
+        print(f"Loaded {map_path} ({description}): not rebuilt "
+              "(set REBUILD_MAP = True to rebuild it).")
+
+        return grid_map
+
+    print("No saved map to reuse: rebuilding it from the images.")
+
+    return None
+
+
 # -----------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------
@@ -504,6 +566,16 @@ def main():
     grid_map_config = GridMapConfig(
         PROJECT_ROOT / "config" / "grid_map_config.yaml"
     )
+
+    class_reducer = ClassReducer(perception_config)
+
+    existing = load_existing_map(grid_map_config, class_reducer)
+
+    if existing is not None:
+        print_summary(existing)
+        plot_outputs(existing)
+        return
+
     camera_calibration = CameraCalibrationConfig(
         PROJECT_ROOT / "config" / "camera_intrinsics.yaml"
     )
@@ -511,7 +583,6 @@ def main():
     paired_by_camera, paired_frames = pair_all_cameras(camera_calibration)
 
     builder = PointCloudBuilder(perception_config, camera_calibration)
-    class_reducer = ClassReducer(perception_config)
     grid_map = GridMap(grid_map_config, class_reducer)
 
     section("Settings")

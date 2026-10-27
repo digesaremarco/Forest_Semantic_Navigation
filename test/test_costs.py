@@ -43,7 +43,7 @@ from costmap.cost_fusion import CostFusion
 
 
 # Map written by test_grid_map.py; plots are saved next to it.
-MAP_PATH = PROJECT_ROOT / "oggi2" / "output" / "grid_map.npz"
+MAP_PATH = PROJECT_ROOT / "spot_runs" / "mission_20261027_091511" / "grid_map.npz"
 OUTPUT_DIR = MAP_PATH.parent
 
 # Saved figures: resolution, and whether to also open them on screen.

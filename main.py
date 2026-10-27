@@ -19,6 +19,8 @@ OUTPUTS: one folder per run under acquisition_config.yaml
 logging.output_root, named <run_prefix>_<date>_<time>:
     mission.log, mission_summary.json (timing, end reason, counters),
     cycles.csv (one row per cycle, with the time of each phase),
+    path.csv + planned_paths.csv (walked path at ~10 Hz, A* plans),
+    mission_path.png (walked path over the final map),
     grid_map.npz + trajectory.npz (loadable by test_costs.py /
     test_planning.py), plots/cycle_NNN.png, and the raw snapshots
     (images_rgb/, depth_data/, odometry/, poses/).
@@ -62,12 +64,13 @@ from pipeline.planning_pipeline import PlanningPipeline
 from mission.mission_config_loader import MissionConfig
 from mission.mission_report import MissionReport
 from mission.mission_timer import MissionTimer
+from mission.mission_plotter import MissionPlotter
 from mission.exploration_mission import ExplorationMission
 
 
 # True: no lease, the robot does not move -- one acquisition + map +
 # plan cycle. Use it for the first run in a new place.
-PLAN_ONLY = True
+PLAN_ONLY = False
 
 CONFIG_DIR = PROJECT_ROOT / "config"
 
@@ -152,7 +155,8 @@ def main():
                 report=report,
                 timer=timer,
                 observation_logger=observation_logger,
-                cycle_plotter=make_cycle_plotter(traversability.grid_map)
+                cycle_plotter=make_cycle_plotter(traversability.grid_map),
+                mission_plotter=MissionPlotter()
             )
 
             mission.run(plan_only=PLAN_ONLY)

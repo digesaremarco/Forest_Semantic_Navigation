@@ -11,7 +11,7 @@
 map:
   # Grid extent in meters (square grid: map_length x map_length).
   # Sized for field tests covering roughly a 20x20 m area.
-  map_length: 40.0
+  map_length: 20.0
 
   # Cell size in meters.
   resolution: 0.04

@@ -24,7 +24,8 @@ acquisition, mapping, planning and navigation together, stop-and-go.
                  -> exploration complete; frontiers left but none
                  reachable -> no_reachable_frontier. Both -> RETURN_HOME.
     NAVIGATE     WaypointFollower walks the whole path, stopping only
-                 at the frontier. Success -> ACQUIRE. Timeout / stalled
+                 at the frontier. With moving_capture enabled, images
+                 are also captured on the way (see MOVING CAPTURE). Success -> ACQUIRE. Timeout / stalled
                  / blocked -> target blacklisted, failure counted,
                  ACQUIRE where the robot stopped. Fault (fall) or
                  command overridden (operator took control) -> the
@@ -34,6 +35,24 @@ acquisition, mapping, planning and navigation together, stop-and-go.
                  replanning from wherever the previous attempt stopped.
                  If it fails, the robot sits where it is.
     SHUTDOWN     sit, power off, return the lease.
+
+MOVING CAPTURE (mission_config.yaml, moving_capture): during NAVIGATE
+the follower calls on_waypoint_passed() each time Spot passes an
+intermediate waypoint, right after the next waypoint's command is
+out -- Spot keeps walking the same A* path. If the robot is at least
+min_distance_m from the last capture, ONE capture attempt is made
+(get_image + decoding only, no settle, no retry) and the snapshot is
+buffered. The buffered snapshots are saved to disk and fused at the
+next stop, in MAP_UPDATE, before the stop snapshot -- so planning
+sees the whole stretch walked. Captures do not run during the return
+home. Snapshots still buffered when the mission ends (fault, Ctrl+C)
+are saved to disk, not fused.
+
+WALKED PATH: the follower reports every body pose it polls (~10 Hz)
+through on_pose(); each one is recorded with its cycle and phase
+(exploration / return_home), plus a row at every capture. Together
+with the planned paths they go to path.csv / planned_paths.csv
+(MissionReport) and, at the end, to mission_path.png (MissionPlotter).
 
 Ctrl+C at any time stops the robot, then the normal shutdown and
 saving run. Any exception does the same and is re-raised afterwards.
@@ -55,6 +74,7 @@ import traceback
 import numpy as np
 
 from acquisition.image_acquirer import AcquisitionError
+from spot.frame_utils import yaw_from_rotation
 from mission.stop_criteria import ExplorationCoverage, StopCriteria
 from navigation.nav_result import NavResult
 from pipeline.planning_pipeline import PlanningPipeline
@@ -101,7 +121,8 @@ class ExplorationMission:
         report,
         timer,
         observation_logger=None,
-        cycle_plotter=None
+        cycle_plotter=None,
+        mission_plotter=None
     ):
         """
         Parameters
@@ -120,6 +141,8 @@ class ExplorationMission:
         cycle_plotter : callable or None
             cycle_plotter(save_path, cost_layer, detection, result,
             robot_xy, title) -- None: no per-cycle plots.
+        mission_plotter : MissionPlotter or None
+            End-of-mission overview (mission_path.png) -- None: none.
         """
 
         self.config = mission_config
@@ -132,9 +155,22 @@ class ExplorationMission:
         self.timer = timer
         self.observation_logger = observation_logger
         self.cycle_plotter = cycle_plotter if mission_config.save_cycle_plots else None
+        self.mission_plotter = mission_plotter if mission_config.save_mission_plot else None
 
         self.coverage = ExplorationCoverage(planning_config.border_margin_cells)
         self.stop_criteria = StopCriteria(mission_config)
+
+        # Moving capture: the follower reports every intermediate
+        # waypoint it passes.
+        self.moving_buffer = []
+        self.last_capture_xy = None
+
+        if mission_config.moving_capture_enabled and follower is not None:
+            follower.on_waypoint_passed = self.on_waypoint_passed
+
+        # Walked path: every pose the follower polls.
+        if follower is not None:
+            follower.on_pose = self.on_robot_pose
 
         self.handlers = {
             MissionState.INIT: self.state_init,
@@ -172,6 +208,8 @@ class ExplorationMission:
             "acquisition_failures": 0,
             "frames_fused": 0,
             "frames_skipped": 0,
+            "moving_snapshots": 0,
+            "moving_capture_failures": 0,
             "nav_succeeded": 0,
             "nav_failed": {},
             "walked_exploration_m": 0.0,
@@ -289,6 +327,8 @@ class ExplorationMission:
 
         self.consecutive_acquisition_failures = 0
         self.stats["snapshots"] += 1
+        self.last_capture_xy = self.snapshot.body_position_xy()
+        self.record_capture_pose(self.snapshot, "stop_capture")
 
         if self.observation_logger is not None:
             with self.timer.measure("logging"):
@@ -297,18 +337,34 @@ class ExplorationMission:
         return MissionState.MAP_UPDATE
 
     def state_map_update(self):
+        moving = self.take_moving_buffer()
+
+        if moving and self.observation_logger is not None:
+            with self.timer.measure("logging"):
+                for snapshot in moving:
+                    self.observation_logger.log(snapshot)
+
         with self.timer.measure("mapping") as span:
-            fused, skipped = self.fuse_snapshot(self.snapshot)
+            fused, skipped = 0, 0
+
+            # Chronological: the snapshots taken on the way, then the
+            # one taken here.
+            for snapshot in moving + [self.snapshot]:
+                snapshot_fused, snapshot_skipped = self.fuse_snapshot(snapshot)
+                fused += snapshot_fused
+                skipped += snapshot_skipped
 
         self.update_coverage()
 
         self.cycle["mapping_s"] = span.duration
         self.cycle["cameras_fused"] = fused
         self.cycle["cameras_skipped"] = skipped
+        self.cycle["moving_fused"] = len(moving)
 
         self.log(
-            f"Fused {fused} camera(s), skipped {skipped} (static) in {span.duration:.2f} s, "
-            f"coverage {self.last_coverage['coverage'] * 100:.1f} %"
+            f"Fused {fused} camera(s) from {len(moving) + 1} snapshot(s) "
+            f"({len(moving)} taken on the move), skipped {skipped} (static) in "
+            f"{span.duration:.2f} s, coverage {self.last_coverage['coverage'] * 100:.1f} %"
         )
 
         if self.config.save_map_every_cycle:
@@ -366,6 +422,7 @@ class ExplorationMission:
         self.cycle["plan_status"] = status
 
         if result is not None:
+            self.report.add_planned_path(self.cycle_index, "exploration", 1, result["waypoints"])
             self.cycle["frontier_x"], self.cycle["frontier_y"] = result["goal_world"]
             self.cycle["waypoints"] = len(result["waypoints"])
 
@@ -476,6 +533,7 @@ class ExplorationMission:
         info["final_distance_m"] = math.hypot(robot_xy[0] - home_xy[0], robot_xy[1] - home_xy[1])
 
         self.timer.mark("return_home_end")
+        self.report.flush_paths()
 
         self.log(
             f"Return home: {'reached' if info['reached'] else 'NOT reached'} after "
@@ -496,6 +554,72 @@ class ExplorationMission:
     # -----------------------------------------------------------------
     # Steps
     # -----------------------------------------------------------------
+
+    def on_robot_pose(self, pose):
+        """WaypointFollower callback: one walked-path row per polled pose."""
+
+        phase = "return_home" if self.state == MissionState.RETURN_HOME else "exploration"
+        self.record_path_pose(pose, phase, "walk")
+
+    def record_capture_pose(self, snapshot, event):
+        R, t = snapshot.vision_tform_body
+        pose = (float(t[0]), float(t[1]), yaw_from_rotation(R))
+        phase = "return_home" if self.state == MissionState.RETURN_HOME else "exploration"
+
+        self.record_path_pose(pose, phase, event)
+
+    def record_path_pose(self, pose, phase, event):
+        elapsed = self.timer.elapsed_since("mission_start") or 0.0
+
+        self.report.add_path_pose(elapsed, self.cycle_index, phase, event, pose)
+
+    def on_waypoint_passed(self, index, waypoint, pose):
+        """
+        WaypointFollower callback (moving capture): one capture attempt
+        if far enough from the last capture, buffered for the next stop.
+        Runs while Spot walks on toward the next waypoint.
+        """
+
+        if self.state != MissionState.NAVIGATE:
+            return
+
+        if self.last_capture_xy is not None:
+            distance = math.hypot(pose[0] - self.last_capture_xy[0], pose[1] - self.last_capture_xy[1])
+
+            if distance < self.config.moving_capture_min_distance_m:
+                return
+
+        with self.timer.measure("moving_acquisition") as span:
+            try:
+                snapshot = self.acquirer.capture(settle=False, retry=False)
+            except AcquisitionError as error:
+                snapshot = None
+                failure = error
+
+        if self.cycle is not None:
+            self.cycle["moving_captured"] = self.cycle.get("moving_captured", 0) + (snapshot is not None)
+            self.cycle["moving_acquisition_s"] = self.cycle.get("moving_acquisition_s", 0.0) + span.duration
+
+        if snapshot is None:
+            self.stats["moving_capture_failures"] += 1
+            self.log(f"Moving capture at waypoint {index} failed: {failure}")
+            return
+
+        self.moving_buffer.append(snapshot)
+        self.stats["moving_snapshots"] += 1
+        self.last_capture_xy = snapshot.body_position_xy()
+        self.record_capture_pose(snapshot, "moving_capture")
+
+        self.log(
+            f"Moving capture at waypoint {index} ({pose[0]:+.2f}, {pose[1]:+.2f}) "
+            f"in {span.duration:.2f} s, {len(self.moving_buffer)} buffered"
+        )
+
+    def take_moving_buffer(self):
+        buffered = self.moving_buffer
+        self.moving_buffer = []
+
+        return buffered
 
     def fuse_snapshot(self, snapshot):
         """Fuse each keyframe camera; returns (fused, skipped)."""
@@ -601,6 +725,7 @@ class ExplorationMission:
             self.log(f"Return home attempt {attempt}: {info['detail']}")
             return "no_plan"
 
+        self.report.add_planned_path(self.cycle_index, "return_home", attempt, result["waypoints"])
         self.log(f"Return home attempt {attempt}: {len(result['waypoints'])} waypoints")
 
         with self.timer.measure("return_navigation"):
@@ -626,6 +751,8 @@ class ExplorationMission:
         try:
             with self.timer.measure("return_acquisition"):
                 snapshot = self.acquirer.capture(settle=True)
+
+            self.record_capture_pose(snapshot, "stop_capture")
 
             if self.observation_logger is not None:
                 self.observation_logger.log(snapshot)
@@ -676,6 +803,7 @@ class ExplorationMission:
         self.cycle["cycle_s"] = time.monotonic() - self.cycle["start_monotonic"]
 
         self.report.write_cycle(self.cycle)
+        self.report.flush_paths()
         self.timer.add("cycle", self.cycle["cycle_s"])
 
         self.cycle = None
@@ -725,15 +853,54 @@ class ExplorationMission:
 
         self.timer.mark("mission_end")
 
+        # Captured on the move but never fused (mission ended while
+        # walking): at least keep the raw data.
+        leftover = self.take_moving_buffer()
+
+        if leftover and self.observation_logger is not None:
+            self.log(f"Saving {len(leftover)} unfused moving snapshot(s) to disk.")
+
+            for snapshot in leftover:
+                self.safe_step("moving snapshot saving", lambda: self.observation_logger.log(snapshot))
+
         self.safe_step("map saving", self.save_map)
         self.safe_step("trajectory saving", self.report.save_trajectory)
+        self.safe_step("path saving", self.report.flush_paths)
 
         summary = self.build_summary()
 
         self.safe_step("summary saving", lambda: self.report.save_summary(summary))
+
+        if self.mission_plotter is not None:
+            self.safe_step("mission plot", lambda: self.plot_mission(summary))
+
         self.print_summary(summary)
 
         return summary
+
+    def plot_mission(self, summary):
+        """mission_path.png: walked path over the final cost map."""
+
+        if not self.report.path_rows:
+            return
+
+        grid_map = self.traversability.grid_map
+        anchored = self.map_anchored()
+
+        self.mission_plotter.plot(
+            save_path=self.report.mission_plot_path,
+            cost_layer=self.traversability.get_cost_layer("total") if anchored else None,
+            resolution=grid_map.resolution,
+            origin=grid_map.get_origin()[:2] if anchored else (0.0, 0.0),
+            cell_n=grid_map.cell_n,
+            path_rows=self.report.path_rows,
+            planned_paths=self.report.planned_paths,
+            home_pose=self.home_pose,
+            title=f"Mission {self.report.run_dir.name}",
+            subtitle=self.mission_plotter.subtitle_from_summary(self.report.to_jsonable(summary))
+        )
+
+        self.log(f"Mission plot saved to {self.report.mission_plot_path}")
 
     def build_summary(self):
         final_pose = None
@@ -755,6 +922,8 @@ class ExplorationMission:
             "acquisition": {
                 "snapshots": self.stats["snapshots"],
                 "failures": self.stats["acquisition_failures"],
+                "moving_snapshots": self.stats["moving_snapshots"],
+                "moving_capture_failures": self.stats["moving_capture_failures"],
                 "frames_fused": self.stats["frames_fused"],
                 "frames_skipped": self.stats["frames_skipped"],
             },
@@ -818,7 +987,9 @@ class ExplorationMission:
 
         acquisition = summary["acquisition"]
         print(
-            f"Snapshots: {acquisition['snapshots']} ({acquisition['failures']} failed), "
+            f"Snapshots: {acquisition['snapshots']} at stops ({acquisition['failures']} failed), "
+            f"{acquisition['moving_snapshots']} on the move "
+            f"({acquisition['moving_capture_failures']} failed), "
             f"frames fused {acquisition['frames_fused']}, skipped {acquisition['frames_skipped']}"
         )
 

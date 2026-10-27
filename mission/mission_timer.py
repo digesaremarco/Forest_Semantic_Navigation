@@ -21,9 +21,12 @@ wall-clock adjustments during the mission):
         acquisition          capture of all cameras (exploration)
         logging              snapshot written to disk
         mapping              SegFormer + point clouds + GridMap fusion
+                             (stop snapshot + those taken on the move)
         planning             C_total + frontier planning
         plotting             per-cycle planning plot
-        navigation           walking to the frontier
+        navigation           walking to the frontier (includes the
+                             moving captures made on the way)
+        moving_acquisition   one capture on the move (moving_capture)
         cycle                one whole exploration cycle
         return_home          the whole return home, of which:
           return_acquisition / return_mapping / return_planning /

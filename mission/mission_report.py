@@ -12,8 +12,20 @@ folder ObservationLogger writes the snapshots to):
                            test_grid_map.py (timestamp, camera_name, R,
                            t, fused) -- test_planning.py / test_costs.py
                            can load it next to grid_map.npz
+    path.csv               the path actually walked: body pose polled
+                           by WaypointFollower (~10 Hz) plus a row at
+                           every capture -- t_s (since mission start),
+                           cycle, phase (exploration | return_home),
+                           event (walk | stop_capture | moving_capture),
+                           x, y, yaw_deg in the vision frame
+    planned_paths.csv      every planned path (A* waypoints): cycle,
+                           phase, attempt, index, x, y
     grid_map.npz           (written by the mission via GridMap.save())
     plots/cycle_NNN.png    (written by the mission, if enabled)
+    mission_path.png       (MissionPlotter: walked path over the map)
+
+path.csv and planned_paths.csv are appended at the end of every cycle
+(flush_paths()), so a crash loses at most the current cycle.
 """
 
 import csv
@@ -24,13 +36,18 @@ from pathlib import Path
 import numpy as np
 
 
+PATH_COLUMNS = ("t_s", "cycle", "phase", "event", "x", "y", "yaw_deg")
+
+PLANNED_COLUMNS = ("cycle", "phase", "attempt", "index", "x", "y")
+
 CYCLE_COLUMNS = (
     "cycle", "wall_time", "exploration_time_s",
     "robot_x", "robot_y", "robot_yaw_deg", "battery_percent",
-    "cameras_fused", "cameras_skipped", "coverage", "observed_cells",
+    "moving_fused", "cameras_fused", "cameras_skipped", "coverage", "observed_cells",
     "plan_status", "frontier_x", "frontier_y", "waypoints",
     "nav_status", "nav_distance_to_goal_m", "nav_walked_m",
-    "acquisition_s", "mapping_s", "planning_s", "navigation_s", "cycle_s",
+    "moving_captured", "acquisition_s", "moving_acquisition_s",
+    "mapping_s", "planning_s", "navigation_s", "cycle_s",
     "note",
 )
 
@@ -66,11 +83,26 @@ class MissionReport:
         self.trajectory_path = self.run_dir / "trajectory.npz"
         self.log_path = self.run_dir / "mission.log"
         self.plots_dir = self.run_dir / "plots"
+        self.path_path = self.run_dir / "path.csv"
+        self.planned_path = self.run_dir / "planned_paths.csv"
+        self.mission_plot_path = self.run_dir / "mission_path.png"
 
-        with open(self.cycles_path, "w", newline="", encoding="utf-8") as file:
-            csv.writer(file).writerow(CYCLE_COLUMNS)
+        for path, columns in (
+            (self.cycles_path, CYCLE_COLUMNS),
+            (self.path_path, PATH_COLUMNS),
+            (self.planned_path, PLANNED_COLUMNS),
+        ):
+            with open(path, "w", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow(columns)
 
         self.trajectory = []
+
+        # Walked path and planned paths: kept in memory (for the final
+        # plot) and appended to their CSV by flush_paths().
+        self.path_rows = []
+        self.planned_paths = []
+        self.path_rows_written = 0
+        self.planned_paths_written = 0
 
         self.log_file = None
         self.original_streams = None
@@ -118,6 +150,61 @@ class MissionReport:
 
         with open(self.cycles_path, "a", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(row)
+
+    def add_path_pose(self, t_s, cycle, phase, event, pose):
+        """One walked-path row; pose = (x, y, yaw [rad]) in vision."""
+
+        self.path_rows.append({
+            "t_s": float(t_s),
+            "cycle": int(cycle),
+            "phase": phase,
+            "event": event,
+            "x": float(pose[0]),
+            "y": float(pose[1]),
+            "yaw_deg": float(np.degrees(pose[2])),
+        })
+
+    def add_planned_path(self, cycle, phase, attempt, waypoints):
+        """The waypoints of one plan (PlanningPipeline output)."""
+
+        self.planned_paths.append({
+            "cycle": int(cycle),
+            "phase": phase,
+            "attempt": int(attempt),
+            "points": [tuple(float(v) for v in waypoint["position"][:2]) for waypoint in waypoints],
+        })
+
+    def flush_paths(self):
+        """Append the rows added since the last flush to the CSVs."""
+
+        new_rows = self.path_rows[self.path_rows_written:]
+
+        if new_rows:
+            with open(self.path_path, "a", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+
+                for row in new_rows:
+                    writer.writerow([
+                        f"{row['t_s']:.3f}", row["cycle"], row["phase"], row["event"],
+                        f"{row['x']:.4f}", f"{row['y']:.4f}", f"{row['yaw_deg']:.2f}",
+                    ])
+
+            self.path_rows_written = len(self.path_rows)
+
+        new_plans = self.planned_paths[self.planned_paths_written:]
+
+        if new_plans:
+            with open(self.planned_path, "a", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+
+                for plan in new_plans:
+                    for index, (x, y) in enumerate(plan["points"]):
+                        writer.writerow([
+                            plan["cycle"], plan["phase"], plan["attempt"], index,
+                            f"{x:.4f}", f"{y:.4f}",
+                        ])
+
+            self.planned_paths_written = len(self.planned_paths)
 
     def add_camera_pose(self, timestamp, camera_name, R, t, fused):
         self.trajectory.append({

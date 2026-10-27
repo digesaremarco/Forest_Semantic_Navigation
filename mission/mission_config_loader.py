@@ -27,6 +27,7 @@ class MissionConfig:
 
         self.load_stop_criteria()
         self.load_return_home()
+        self.load_moving_capture()
         self.load_keyframes()
         self.load_output()
 
@@ -82,6 +83,17 @@ class MissionConfig:
             section.get("max_attempts"), "return_home.max_attempts"
         )
 
+    def load_moving_capture(self):
+        section = self.get_section("moving_capture")
+
+        self.moving_capture_enabled = self.validate_bool(
+            section.get("enabled"), "moving_capture.enabled"
+        )
+
+        self.moving_capture_min_distance_m = self.validate_positive_number(
+            section.get("min_distance_m"), "moving_capture.min_distance_m"
+        )
+
     def load_keyframes(self):
         section = self.get_section("keyframes")
 
@@ -113,6 +125,10 @@ class MissionConfig:
 
         self.save_map_every_cycle = self.validate_bool(
             section.get("save_map_every_cycle"), "output.save_map_every_cycle"
+        )
+
+        self.save_mission_plot = self.validate_bool(
+            section.get("save_mission_plot"), "output.save_mission_plot"
         )
 
     def as_dict(self):

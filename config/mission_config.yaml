@@ -18,14 +18,14 @@ stop_criteria:
   # (planning_config.yaml: border_margin_cells). In a forest a large
   # part is never observable (trunks, bushes): start low and tune it
   # in the field.
-  coverage_threshold: 0.6
+  coverage_threshold: 0.85
 
   # Exploration time cap [s], from the first acquisition. The return
   # home is NOT counted.
   max_exploration_time_s: 1800.0
 
   # Locomotion battery [%]. Leave margin for the return home.
-  min_battery_percent: 35.0
+  min_battery_percent: 25.0
 
   # Consecutive navigation failures (timeout / stalled / blocked).
   # Each failed target is blacklisted; reaching this many in a row
@@ -41,6 +41,24 @@ return_home:
   # Each attempt re-acquires, updates the map and replans from where
   # the robot is (an earlier attempt may have stopped halfway).
   max_attempts: 3
+
+moving_capture:
+  # Capture images WHILE walking to the frontier, fuse them at the next
+  # stop. Each capture happens when an intermediate waypoint is passed,
+  # right after the command for the next one is sent: Spot keeps
+  # walking along the A* path, nothing about the path changes. Only
+  # get_image + decoding run on the move (~0.2-0.3 s); SegFormer and
+  # the GridMap fusion of the buffered snapshots happen at the stop,
+  # before planning. Fills the gaps a stop-only acquisition leaves:
+  # the blind ring around the robot at every stop and the wedges
+  # between the cameras' fields of view.
+  enabled: true
+
+  # Minimum distance between two captures (on the move or at a stop)
+  # [m]. Waypoints are waypoint_spacing_m apart (0.5 m): 1.0 captures
+  # at about every second waypoint. Each capture adds ~1 s of fusion
+  # at the next stop.
+  min_distance_m: 1.5
 
 keyframes:
   # A camera is fused only if it moved or turned at least this much
@@ -58,8 +76,14 @@ output:
 
   # Planning overlay (cost + frontiers + path) saved at every cycle,
   # plots/cycle_NNN.png. About 1 s per cycle on the Jetson.
-  save_cycle_plots: false
+  save_cycle_plots: true
 
   # Save grid_map.npz after every cycle (crash safety), not only at the
   # end. A few seconds per cycle.
   save_map_every_cycle: false
+
+  # Overview at the end of the mission, mission_path.png: the path
+  # actually walked over the final cost map, with stops, captures,
+  # planned paths, frontier targets and home. Regenerable offline from
+  # the run folder with test/plot_mission.py.
+  save_mission_plot: true

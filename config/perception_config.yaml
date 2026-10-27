@@ -7,7 +7,7 @@ model:
   # A TensorRT engine only runs with the TensorRT version and the GPU it
   # was built on: build it on the Jetson itself (trtexec), from the same
   # ONNX as `path`.
-  backend: "tensorrt"
+  backend: "onnx"
 
   # ONNX model (backend: onnx).
   path: "models/segformer_b1_tversky.onnx"

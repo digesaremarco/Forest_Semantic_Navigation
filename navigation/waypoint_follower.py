@@ -11,6 +11,23 @@ waypoint. Only the final waypoint (the frontier) is driven to a full
 stop: it counts as reached when Spot reports the trajectory STOPPED
 with the body within goal_tolerance_m.
 
+PASSED-WAYPOINT CALLBACK (optional, on_waypoint_passed): called once
+for every intermediate waypoint the robot passes, as
+on_waypoint_passed(index, waypoint, pose), right AFTER the command
+for the next waypoint has been sent -- so whatever the callback does
+(e.g. ExplorationMission capturing images on the move), Spot keeps
+walking along the same path toward the next waypoint meanwhile. The
+path, and so the A* plan, is not changed. Its run time is not
+charged to the next waypoint's time budget. An exception in the
+callback is printed and ignored: it never stops the navigation
+(Ctrl+C still does). Not called for the final waypoint, nor for the
+leading waypoints skipped at the start.
+
+POSE CALLBACK (optional, on_pose): on_pose(pose) with the body pose
+(x, y, yaw) in vision, every time the follower polls it (every
+feedback_period_s while walking) -- ExplorationMission records the
+walked path with it. Same error policy as on_waypoint_passed.
+
 HEADING: each waypoint's heading points to the next one
 (WaypointGenerator), so Spot walks facing forward and arrives at the
 frontier facing past it -- the front cameras look at the unexplored
@@ -75,7 +92,7 @@ COMMAND_END_TIME_MARGIN_S = 5.0
 
 class WaypointFollower:
 
-    def __init__(self, navigation_config, spot):
+    def __init__(self, navigation_config, spot, on_waypoint_passed=None, on_pose=None):
         """
         Parameters
         ----------
@@ -83,12 +100,26 @@ class WaypointFollower:
 
         spot : SpotInterface
             Connected, with the lease, powered on and standing.
+
+        on_waypoint_passed : callable, optional
+            on_waypoint_passed(index, waypoint, pose) -- see module
+            docstring. Can also be set later as an attribute.
+
+        on_pose : callable, optional
+            on_pose(pose) -- see module docstring. Can also be set
+            later as an attribute.
         """
 
         self.config = navigation_config
         self.spot = spot
+        self.on_waypoint_passed = on_waypoint_passed
+        self.on_pose = on_pose
 
         self.mobility_params = self.build_mobility_params()
+
+    # -----------------------------------------------------------------
+    # Public interface
+    # -----------------------------------------------------------------
 
     def follow(self, waypoints):
         """
@@ -137,7 +168,11 @@ class WaypointFollower:
             for index in range(first, len(waypoints)):
                 is_final = index == len(waypoints) - 1
 
-                outcome, message = self.drive_to(waypoints[index], is_final, tracker, start_time)
+                passed = (index - 1, waypoints[index - 1]) if index > first else None
+
+                outcome, message = self.drive_to(
+                    waypoints[index], is_final, tracker, start_time, passed
+                )
 
                 if outcome != NavResult.REACHED:
                     self.stop_robot()
@@ -179,10 +214,16 @@ class WaypointFollower:
         except Exception as error:
             print(f"[WaypointFollower] WARNING: stop command failed: {error}")
 
-    def drive_to(self, waypoint, is_final, tracker, start_time):
+    # -----------------------------------------------------------------
+    # One waypoint
+    # -----------------------------------------------------------------
+
+    def drive_to(self, waypoint, is_final, tracker, start_time, passed=None):
         """
         Command one waypoint and poll until it is passed (intermediate),
-        reached (final) or a failure is detected.
+        reached (final) or a failure is detected. `passed` is the
+        (index, waypoint) just passed, reported to on_waypoint_passed
+        once this waypoint's command is out.
 
         Returns
         -------
@@ -196,6 +237,10 @@ class WaypointFollower:
         budget = config.base_timeout_s + distance / config.nominal_speed_mps
 
         command_id = self.send_trajectory(x, y, waypoint["heading"], budget + COMMAND_END_TIME_MARGIN_S)
+
+        # The robot is already walking toward this waypoint.
+        if passed is not None:
+            self.notify_passed(passed[0], passed[1], tracker["pose"])
 
         waypoint_start = time.monotonic()
 
@@ -212,6 +257,7 @@ class WaypointFollower:
 
             state = self.spot.get_robot_state()
             self.update_pose(tracker, self.spot.get_body_pose_2d(state))
+            self.notify_pose(tracker["pose"])
 
             distance = self.distance(tracker["pose"], (x, y))
 
@@ -277,6 +323,28 @@ class WaypointFollower:
                     f"path duration cap {config.max_path_duration_s:.0f} s exceeded"
                 )
 
+    def notify_pose(self, pose):
+        if self.on_pose is None:
+            return
+
+        try:
+            self.on_pose(pose)
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            print(f"[WaypointFollower] WARNING: on_pose failed: {error!r}")
+
+    def notify_passed(self, index, waypoint, pose):
+        if self.on_waypoint_passed is None:
+            return
+
+        try:
+            self.on_waypoint_passed(index, waypoint, pose)
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            print(f"[WaypointFollower] WARNING: on_waypoint_passed failed: {error!r}")
+
     def send_trajectory(self, x, y, heading, validity_s):
         command = RobotCommandBuilder.synchro_se2_trajectory_point_command(
             goal_x=x,
@@ -291,6 +359,10 @@ class WaypointFollower:
         return self.spot.robot_command_client.robot_command(
             command, end_time_secs=time.time() + validity_s
         )
+
+    # -----------------------------------------------------------------
+    # Mobility parameters
+    # -----------------------------------------------------------------
 
     def build_mobility_params(self):
         config = self.config
@@ -338,7 +410,10 @@ class WaypointFollower:
 
         return params
 
+    # -----------------------------------------------------------------
     # Helpers
+    # -----------------------------------------------------------------
+
     def first_target_index(self, waypoints, pose):
         """
         Where to start: from the waypoint closest to the robot (never
