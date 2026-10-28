@@ -29,7 +29,7 @@ sys.path.append(str(PROJECT_ROOT))
 
 
 # Run folder written by main.py.
-RUN_DIR = PROJECT_ROOT / "spot_runs" / "mission_20261027_100642"
+RUN_DIR = PROJECT_ROOT / "spot_runs" / "mission_20261027_111938"
 
 OUTPUT_NAME = "mission_path.png"
 
